@@ -1,0 +1,2670 @@
+/*
+ * DỰ ÁN: HỆ THỐNG ĐIỀU KHIỂN 4 RELAY SỬ DỤNG HẸN GIỜ, CHU KỲ VÀ MENU LCD 16X2 I2C
+ * PHIÊN BẢN: 137.8 (Fix lỗi biên dịch, LCD Sleep/Wake-up, và Lỗi Logic Alert/Cycle Limit)
+ *
+ * CÁC THAY ĐỔI VÀ TỐI ƯU HÓA ĐÃ ÁP DỤNG:
+ * 1. FIX LỖI LOGIC: Sửa lỗi ép kiểu chuỗi RAM/PROGMEM trong hàm showAlert (handleButtonSelect_Hold).
+ * 2. FIX LOGIC CYCLE LIMIT: Đơn giản hóa logic tải cycle limit từ EEPROM để giới hạn chính xác (max 99 hoặc 9999=INF).
+ * 3. Thêm LCD Sleep/Wake-up: Tắt đèn nền LCD sau 30 giây không hoạt động.
+ * 4. Tối ưu hóa: Loại bỏ hoàn toàn logic và biến Mật khẩu, Fast Step.
+ *
+ * CẤU HÌNH MẶC ĐỊNH: R1/R2=MAN/ON, R3=AUT (11:00-21:00), R4=CYC (22:00-22:10, 5m On/Off, Limit=99).
+ */
+
+// 1. THƯ VIỆN
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <EEPROM.h>
+#include <avr/wdt.h>
+#include <stddef.h>
+
+// 2. ĐỊNH NGHĨA CÁC HẰNG SỐ CẤU HÌNH
+const int LCD_I2C_ADDR = 0x27;
+
+// *** CHÂN NÚT NHẤN ***
+const uint8_t BUTTON_UP_PIN = 13;
+const uint8_t BUTTON_SELECT_PIN = 12;
+const uint8_t BUTTON_DOWN_PIN = 11;
+
+// *** CHÂN RELAY ***
+const uint8_t relayPins[4] = { 10, 9, 8, 7 };
+
+// *** CHÂN CẢM BIẾN (DIGITAL) ***
+const uint8_t SENSOR_PINS[4] = { 6, 5, 4, 3 };
+
+// *** CẤU HÌNH CÁC HẰNG SỐ CHUNG ***
+const uint8_t NUM_RELAYS = 4;
+const uint8_t NUM_TIMERS_PER_RELAY = 4;
+const unsigned long DEBOUNCING_TIME = 150;
+const unsigned long AUTO_RETURN_DELAY = 10000;
+const unsigned long EEPROM_SAVE_DELAY = 3000;
+const char EEPROM_MAGIC_BYTE = 'D';
+const unsigned long CYCLE_SAVE_INTERVAL = 900000;  // 15 phút
+const uint16_t CYCLE_COUNT_THRESHOLD = 10;
+const unsigned long RTC_EXIT_HOLD_TIME = 3000;
+const unsigned long CYCLE_RESET_HOLD_TIME = 2000;
+const unsigned long ALERT_DISPLAY_TIME = 1500;
+const unsigned long QUICK_SELECT_TIMEOUT = 3000;
+const unsigned long OVERRIDE_HOLD_TIME = 1500;
+const unsigned long CYCLE_RESUME_SAVE_INTERVAL = 900000;  // 15 phút (900 giây) - Tối ưu hóa EEPROM
+
+// === THÔNG SỐ LCD WAKE-UP/SLEEP ===
+const unsigned long LCD_SLEEP_DELAY = 30000;  // 30 giây
+// =====================================
+
+// === GIỚI HẠN TỐC ĐỘ CẬP NHẬT LCD (Cho Menu) ===
+const unsigned long LCD_UPDATE_INTERVAL = 250;
+unsigned long lastLcdUpdate = 0;
+// =====================================
+
+
+// 3. KHỞI TẠO ĐỐI TƯỢNG PHẦN CỨNG
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, 16, 2);
+RTC_DS1307 RTC;
+
+// 4. ĐỊNH NGHĨA ENUMS VÀ CẤU TRÚC DỮ LIỆU
+enum MenuState : uint8_t {
+  MENU_HOME = 0,
+  MENU_RELAY_SETTINGS = 2,
+  MENU_RTC_EDIT = 4,
+  MENU_RTC_MAIN_MENU = 6,
+  MENU_SAVE_PROMPT = 9,
+  MENU_ALERT = 10
+};
+enum RelayMode : uint8_t {
+  MODE_MAN = 0,
+  MODE_AUT = 1,
+  MODE_CYC = 2
+};
+enum SensorLogic : uint8_t {
+  SENSOR_LOGIC_LOW_ACTIVE = 0,
+  SENSOR_LOGIC_HIGH_ACTIVE = 1
+};
+enum RelayMenuOption : uint8_t {
+  RELAY_BACK = 0,
+  RELAY_MODE = 1,
+  RELAY_STATUS_OR_TIMER1 = 2,
+  RELAY_TIMER2 = 3,
+  RELAY_TIMER3 = 4,
+  RELAY_TIMER4 = 5,
+  RELAY_SENSOR_GATE = 6,
+  RELAY_SENSOR_LOGIC = 7
+};
+enum TimerMenuOption : uint8_t {
+  TIMER_BACK = 0,
+  TIMER_MODE = 1,
+  TIMER_DOW_SETTING = 2,
+  TIMER_ON_TIME = 3,
+  TIMER_OFF_TIME = 4,
+  TIMER_CYCLE_ON_DUR = 5,
+  TIMER_CYCLE_OFF_DUR = 6,
+  TIMER_CYCLE_LIMIT = 7,
+  TIMER_RESET_COUNT = 8
+};
+enum RtcEditStep : uint8_t {
+  RTC_EDIT_HH,
+  RTC_EDIT_MM,
+  RTC_EDIT_DD,
+  RTC_EDIT_MO,
+  RTC_EDIT_YY,
+  RTC_EDIT_SAVE,
+  RTC_EDIT_CANCEL,
+  RTC_EDIT_BACK
+};
+enum SettingStep : uint8_t {
+  STEP_HH_OR_VALUE = 0,
+  STEP_MM = 1,
+  STEP_DONE = 3,
+  STEP_NAV_TIMER = 4,
+};
+enum RtcMenuOption : uint8_t {
+  RTC_MENU_TIME,
+  RTC_MENU_DATE,
+  RTC_MENU_BACK
+};
+
+typedef struct {
+  uint8_t hour;
+  uint8_t minute;
+} TimeOfDay_MinOnly;
+
+typedef struct {
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t second;
+} TimeOfDay_Full;
+
+typedef struct {
+  uint8_t minute;
+  uint8_t second;
+} TimeDuration;
+
+typedef struct {
+  uint8_t mode;
+  TimerMenuOption selectedOption;
+  SettingStep setting_step;
+  TimeOfDay_MinOnly time_on;
+  TimeOfDay_MinOnly time_off;
+  TimeDuration cycle_duration_on;
+  TimeDuration cycle_duration_off;
+  uint16_t cycle_limit;
+  uint16_t cycle_count;
+  uint8_t dow_mask;
+
+  // Cache và Logic
+  uint32_t cached_on_sec;
+  uint32_t cached_off_sec;
+  uint32_t cached_time_on_sec;
+  uint32_t cached_time_off_sec;
+  bool cycle_is_on;
+  uint32_t cycle_last_state_change_time_seconds;
+} TimerData;
+
+typedef struct {
+  RelayMode mode;
+  uint8_t status;
+  RelayMenuOption selectedOption;
+  bool sensor_gate_enabled;
+  SensorLogic sensor_logic;
+} RelayData;
+
+typedef struct {
+  MenuState currentState;
+  uint8_t selectedIndex;
+} Navigation;
+
+typedef struct {
+  uint8_t mode;
+  TimeOfDay_MinOnly time_on;
+  TimeOfDay_MinOnly time_off;
+  TimeDuration cycle_duration_on;
+  TimeDuration cycle_duration_off;
+  uint16_t cycle_limit;
+  uint16_t cycle_count;
+  uint8_t dow_mask;
+  uint8_t cycle_is_on_state;
+  uint32_t cycle_start_time_sec;
+} EepromTimerData;
+
+typedef struct {
+  RelayMode relay_mode[4];
+  uint8_t relay_status[4];
+  EepromTimerData timers[4][4];
+  bool sensor_gate_enabled[4];
+  SensorLogic sensor_logic[4];
+  char magic_byte;
+} EepromData;
+
+
+// 5. KHAI BÁO BIẾN TOÀN CỤC VÀ HẰNG SỐ
+DateTime now;
+uint32_t currentTimeSeconds;
+TimeOfDay_Full currentTime;
+Navigation nav;
+RelayData relays[NUM_RELAYS];
+TimerData timers[NUM_RELAYS][NUM_TIMERS_PER_RELAY];
+EepromData eepromData;
+unsigned long lastActionTime = 0;
+bool settings_changed = false;
+unsigned long lastSettingsChangeTime = 0;
+uint8_t currentRelayOutputState[4] = { LOW };
+uint8_t lastSecond = 60;
+uint8_t lastMinute = 60;
+uint8_t lastRelayState[4] = { 2 };
+MenuState currentDisplayedMenu = MENU_HOME;
+bool rtc_initialized = false;
+DateTime rtc_temp_time;
+bool needsDisplayUpdate = true;
+bool cycle_count_changed = false;
+unsigned long lastCycleCountSaveTime = 0;
+unsigned long lastCycleResumeSaveTime = 0;
+
+uint16_t cycleCountBuffer[NUM_RELAYS][NUM_TIMERS_PER_RELAY] = { 0 };
+
+RtcEditStep rtcEditStep;
+RtcMenuOption rtcMenuOption = RTC_MENU_TIME;
+bool buttonClickProcessed = false;
+uint8_t dow_cursor[NUM_RELAYS][NUM_TIMERS_PER_RELAY] = { 0 };
+
+unsigned long pressSelectStartTime = 0;
+bool isHoldingSelect = false;
+unsigned long selectHoldStartTime = 0;
+
+volatile bool buttonUpFlag = false;
+volatile bool buttonDownFlag = false;
+volatile bool buttonSelectFlag = false;
+volatile unsigned long interruptEndTime = 0;
+volatile uint8_t lastButtonState[3] = { HIGH, HIGH, HIGH };  // UP, SELECT, DOWN
+
+// **MỚI: Trạng thái LCD**
+bool lcd_is_awake = true;
+
+const char RELAY_ON_CHAR = '*';
+const char RELAY_OFF_CHAR = '-';
+const char SENSOR_ACTIVE_CHAR = '!';
+const char SENSOR_INACTIVE_CHAR = '-';
+
+// Biến cho UX/Tối ưu hiển thị Dòng 1
+uint8_t lastDay = 32;
+
+
+// Dùng PROGMEM cho các chuỗi hiển thị dài
+const char MSG_RTC_ERROR[] PROGMEM = "RTC ERROR!";
+const char MSG_SAVE_PROCESS[] PROGMEM = "DANG LUU.........";
+const char MSG_EEPROM_RESET_OK[] PROGMEM = "EEPROM RESET OK!";
+const char MSG_COUNT_RESET_OK[] PROGMEM = "COUNT RESET OK!";
+const char MSG_ON_OFF_ERROR[] PROGMEM = "ON=OFF! Auto OFF";
+const char STR_ON[] PROGMEM = "ON";
+const char STR_OFF[] PROGMEM = "OFF";
+const char MSG_TIMER_ACTIVE[] PROGMEM = "TIMER IS ACTIVE!";
+const char MSG_OVERRIDE_OK[] PROGMEM = "OVERRIDE OK!";
+const char MSG_SENSOR_DISABLED[] PROGMEM = "SEN OFF";
+
+const __FlashStringHelper* currentAlertMessage = nullptr;
+char currentAlertMessageRam[16] = { 0 };  // Buffer cho thông báo động (RAM)
+unsigned long alertStartTime = 0;
+MenuState stateBeforeAlert;
+
+uint8_t currentDayMask = 0;
+uint8_t previousDayMask = 0;
+int8_t currentDayOfWeek = -1;
+
+// 6. KHAI BÁO NGUYÊN MẪU HÀM
+void handleButtons();
+void updateDisplay();
+void handleBackgroundTasks(unsigned long currentMillis);
+void wakeLcd();  // **Hàm đánh thức LCD**
+
+void displayRelayMenu(uint8_t r);
+void displayTimerMenu(uint8_t r);
+void displayRtcMainMenu();
+
+void displayRtcEdit_Dynamic();
+void updateRtcEdit_Cursor();
+void navigateRtcEdit(bool isUp, uint16_t step);
+void selectRtcEdit();
+
+void handleButtonUp(unsigned long currentMillis);
+void handleButtonDown(unsigned long currentMillis);
+void handleButtonSelect_Click();
+void handleButtonSelect_Hold(bool checkCycleReset);
+
+void navigateRelaySettings(uint8_t r, bool isUp);
+void navigateTimerMenu(uint8_t r, uint8_t t, bool isUp);
+void navigateSavePrompt(bool isUp);
+void selectSavePrompt();
+
+void selectRelaySettings(uint8_t r);
+// SỬA LỖI TYPO VÀ THIẾU THAM SỐ:
+void selectTimerSettings(uint8_t r, uint8_t t);
+
+void runRelay(uint8_t r, uint32_t currentTimeSeconds);
+
+void saveSettings();
+void updateCycleCountsInEeprom();
+void updateRelayStatusInEeprom();
+void updateCycleResumeStateInEeprom(uint8_t r, uint8_t t);
+void loadSettings();
+void resetSettings();
+
+void printTime(uint8_t hour, uint8_t minute, uint8_t second, bool includeSeconds);
+void printCycleTime(uint8_t minute, uint8_t second);
+void printPaddedLimit(uint16_t limit, bool includeSeconds);
+const __FlashStringHelper* getDowMenuStr(uint8_t index);
+void showAlert(const __FlashStringHelper* message);  // Cho chuỗi PROGMEM
+void showAlertRam(const char* message);              // **MỚI: Cho chuỗi RAM (động)**
+
+void navigateSettingValue(uint8_t r, uint8_t t, bool isUp, uint16_t step);
+
+void updateTimeValue(uint8_t r, uint8_t t, bool isHour, bool isUp, uint8_t step);
+void updateDurationValue(uint8_t r, uint8_t t, bool isMinute, bool isUp, uint16_t step);
+void updateCountValue(uint8_t r, uint8_t t, bool isUp, uint16_t step);
+void updateCursorPos(uint8_t r, uint8_t t);
+const __FlashStringHelper* getDayStr(uint8_t dayOfWeek);
+const __FlashStringHelper* getModeStr(RelayMode mode);
+bool isSensorConditionMet(uint8_t r);
+
+void updateHomeTime(bool forceFullDisplayUpdate);
+
+
+// 7. HÀM SETUP()
+void setup() {
+  lcd.init();
+  lcd.backlight();
+  lcd_is_awake = true;  // Khởi tạo LCD ở trạng thái bật
+
+  for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], LOW);
+    lastRelayState[i] = LOW;
+
+    pinMode(SENSOR_PINS[i], INPUT_PULLUP);
+  }
+  Wire.begin();
+
+  if (!RTC.begin()) {
+    rtc_initialized = false;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print((const __FlashStringHelper*)MSG_RTC_ERROR);
+    lcd.setCursor(0, 1);
+    lcd.print(F("SAFE MODE ON"));
+  } else {
+    if (!RTC.isrunning()) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(F("RTC NOT RUNNING!"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("PLEASE SET TIME!"));
+
+      // 💡 HÃY BỎ BÌNH LUẬN DÒNG DƯỚI ĐÂY KHI BẠN TẢI LÊN LẦN ĐẦU
+      // ĐỂ ĐẶT RTC BẰNG THỜI GIAN CỦA MÁY TÍNH HIỆN TẠI!
+      // SAU ĐÓ, BÌNH LUẬN NÓ LẠI TRƯỚC KHI TẢI LÊN BẤT KỲ LẦN NÀO KHÁC.
+      // RTC.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+      delay(1500);
+      lcd.clear();
+    }
+    rtc_initialized = true;
+    now = RTC.now();
+  }
+
+  pinMode(BUTTON_UP_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_SELECT_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_DOWN_PIN, INPUT_PULLUP);
+
+  // Kiểm tra tổ hợp phím reset EEPROM
+  if (digitalRead(BUTTON_UP_PIN) == LOW && digitalRead(BUTTON_DOWN_PIN) == LOW) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print(F("HOLD UP+DW RST"));
+    lcd.setCursor(0, 1);
+    lcd.print(F("EEPROM (3s)..."));
+
+    wdt_enable(WDTO_4S);
+    delay(3000);
+    wdt_reset();
+
+    if (digitalRead(BUTTON_UP_PIN) == LOW && digitalRead(BUTTON_DOWN_PIN) == LOW) {
+      resetSettings();
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print((const __FlashStringHelper*)MSG_EEPROM_RESET_OK);
+      delay(1500);
+      wdt_reset();
+    }
+    wdt_disable();
+  }
+
+  nav.selectedIndex = 0;
+  nav.currentState = MENU_HOME;
+  currentDisplayedMenu = MENU_HOME;
+  lastActionTime = millis();  // Khởi tạo lastActionTime để LCD không ngủ ngay lập tức
+  loadSettings();
+
+  for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+    for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+      cycleCountBuffer[r][t] = timers[r][t].cycle_count;
+    }
+  }
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F(" I LOVE DUTHY"));
+  lcd.setCursor(0, 1);
+  lcd.print(F(" SYSTEM LOADING"));
+
+  delay(3000);
+
+  lcd.clear();
+  wdt_enable(WDTO_2S);
+}
+
+// 8. HÀM LOOP() CHÍNH
+void loop() {
+  wdt_reset();
+
+  unsigned long currentMillis = millis();
+
+  // === POLLING ĐƠN GIẢN VÀ GHI ĐÈ CỜ ===
+  if (digitalRead(BUTTON_UP_PIN) == LOW) buttonUpFlag = true;
+  if (digitalRead(BUTTON_SELECT_PIN) == LOW) buttonSelectFlag = true;
+  if (digitalRead(BUTTON_DOWN_PIN) == LOW) buttonDownFlag = true;
+
+  handleButtons();
+  // ===============================================
+
+  if (rtc_initialized) {
+    if (currentTime.second != RTC.now().second()) {
+      now = RTC.now();
+
+      currentTime.hour = now.hour();
+      currentTime.minute = now.minute();
+      currentTime.second = now.second();
+
+      currentTimeSeconds = (uint32_t)currentTime.hour * 3600 + (uint32_t)currentTime.minute * 60 + currentTime.second;
+
+      currentDayOfWeek = now.dayOfTheWeek();
+
+      uint8_t dowBit;
+      if (currentDayOfWeek == 0) dowBit = 6;
+      else dowBit = currentDayOfWeek - 1;
+      currentDayMask = 1 << dowBit;
+
+      uint8_t prevDowBit;
+      uint8_t prevDayOfWeek = (currentDayOfWeek == 0) ? 6 : currentDayOfWeek - 1;
+      if (prevDayOfWeek == 0) prevDowBit = 6;
+      else prevDowBit = prevDayOfWeek - 1;
+      previousDayMask = 1 << prevDowBit;
+    }
+  } else {
+    for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+      if (relays[r].mode != MODE_MAN) {
+        relays[r].mode = MODE_MAN;
+        settings_changed = true;
+        lastSettingsChangeTime = currentMillis;
+      }
+    }
+    currentTime.hour = 0;
+    currentTime.minute = 0;
+    currentTime.second = 0;
+    currentTimeSeconds = 0;
+  }
+
+  handleBackgroundTasks(currentMillis);
+
+  for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+    runRelay(i, currentTimeSeconds);
+  }
+  updateDisplay();
+}
+
+// **HÀM ĐÁNH THỨC LCD**
+void wakeLcd() {
+  if (!lcd_is_awake) {
+    lcd.backlight();
+    // Bắt buộc vẽ lại màn hình khi đánh thức
+    currentDisplayedMenu = (MenuState)0xFF;
+    needsDisplayUpdate = true;
+    lcd_is_awake = true;
+  }
+  // Cập nhật thời gian hành động cuối cùng
+  lastActionTime = millis();
+}
+
+// 9. HÀM TÁC VỤ NỀN & HIỂN THỊ
+void handleBackgroundTasks(unsigned long currentMillis) {
+
+  // **LOGIC LCD SLEEP/WAKE-UP**
+  if (lcd_is_awake && nav.currentState == MENU_HOME && (currentMillis - lastActionTime >= LCD_SLEEP_DELAY)) {
+    lcd.noBacklight();
+    lcd_is_awake = false;
+    // Không cần xử lý các tác vụ nền khác nếu LCD đang ngủ.
+    return;
+  }
+  // Nếu LCD đang ngủ, chỉ thực hiện WDT reset và kiểm tra rtc/relay
+  if (!lcd_is_awake && (currentTime.second != lastSecond)) return;  // Chỉ chạy background nếu có thời gian thay đổi
+
+
+  if (nav.currentState == MENU_ALERT) {
+    if ((currentAlertMessage != nullptr || currentAlertMessageRam[0] != 0) && currentMillis - alertStartTime >= ALERT_DISPLAY_TIME) {
+      currentAlertMessage = nullptr;
+      currentAlertMessageRam[0] = 0;
+      MenuState returnState = stateBeforeAlert;
+      nav.currentState = returnState;
+      lastActionTime = currentMillis;
+      needsDisplayUpdate = true;
+      lcd.noCursor();
+      lcd.noBlink();
+    }
+    return;
+  }
+
+  bool isRtcMenu = (nav.currentState == MENU_RTC_EDIT);
+  bool isEditingTimer = false;
+  if (nav.currentState == MENU_RELAY_SETTINGS) {
+    uint8_t r = nav.selectedIndex;
+    RelayMenuOption selected = relays[r].selectedOption;
+    if (selected >= RELAY_STATUS_OR_TIMER1 && selected <= RELAY_TIMER4) {
+      uint8_t t = selected - RELAY_STATUS_OR_TIMER1;
+      if (timers[r][t].setting_step == STEP_HH_OR_VALUE || timers[r][t].setting_step == STEP_MM || (timers[r][t].selectedOption == TIMER_DOW_SETTING && timers[r][t].setting_step != STEP_NAV_TIMER)) {
+        isEditingTimer = true;
+      }
+    }
+  }
+
+  // Auto-return logic
+  if (nav.currentState != MENU_HOME && (currentMillis - lastActionTime >= AUTO_RETURN_DELAY) && nav.currentState != MENU_SAVE_PROMPT && !isRtcMenu && !isEditingTimer && nav.currentState != MENU_RTC_MAIN_MENU) {
+    nav.currentState = MENU_HOME;
+    needsDisplayUpdate = true;
+    nav.selectedIndex = 0;
+    lcd.noCursor();
+    lcd.noBlink();
+  }
+
+  // Logic lưu cấu hình cài đặt (EEPROM_SAVE_DELAY)
+  if (settings_changed && (currentMillis - lastSettingsChangeTime >= EEPROM_SAVE_DELAY) && nav.currentState == MENU_HOME) {
+    showAlert((const __FlashStringHelper*)MSG_SAVE_PROCESS);
+    saveSettings();
+    settings_changed = false;
+    needsDisplayUpdate = true;
+  }
+
+  // LOGIC LƯU CYCLE COUNT
+  bool timeToSave = (currentMillis - lastCycleCountSaveTime > CYCLE_SAVE_INTERVAL);
+  if (cycle_count_changed && (timeToSave || nav.currentState == MENU_HOME)) {
+    updateCycleCountsInEeprom();
+    cycle_count_changed = false;
+    lastCycleCountSaveTime = currentMillis;
+  }
+
+  // LOGIC LƯU TRẠNG THÁI CHU KỲ (POWER-LOSS RESUME)
+  if (currentMillis - lastCycleResumeSaveTime >= CYCLE_RESUME_SAVE_INTERVAL) {
+    for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+      if (relays[r].mode == MODE_CYC) {
+        for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+          if (timers[r][t].cycle_last_state_change_time_seconds != 0 || (timers[r][t].mode == 1 && timers[r][t].cycle_count >= timers[r][t].cycle_limit && timers[r][t].cycle_limit != 9999)) {
+            updateCycleResumeStateInEeprom(r, t);
+          }
+        }
+      }
+    }
+    lastCycleResumeSaveTime = currentMillis;
+  }
+}
+
+// 10. HÀM HIỂN THỊ (DISPLAY)
+void updateHomeRelayStatus() {
+  if (!lcd_is_awake) return;  // Không vẽ nếu LCD đang ngủ
+
+  if (rtc_initialized) {
+    // Vị trí Status Relay (Dòng 0, ký tự 12)
+    lcd.setCursor(12, 0);
+    for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+      lcd.print(currentRelayOutputState[i] == HIGH ? RELAY_ON_CHAR : RELAY_OFF_CHAR);
+      lastRelayState[i] = currentRelayOutputState[i];
+    }
+
+    bool isRtcSelected = nav.selectedIndex == NUM_RELAYS;
+    bool showQuickSelect = (millis() - lastActionTime < QUICK_SELECT_TIMEOUT) && (lastActionTime != 0);
+
+    lcd.setCursor(0, 1);
+
+    if (isRtcSelected) {
+      lcd.print(F("> RTC Setting       "));
+      lastDay = 32;
+    } else if (showQuickSelect) {
+      uint8_t r = nav.selectedIndex;
+      RelayData currentRelay = relays[r];
+
+      // >R[#]:MODE[*][!]
+      lcd.print(F(">R"));
+      lcd.print(r + 1);
+      lcd.print(F(":"));
+      lcd.print(getModeStr(currentRelay.mode));
+
+      lcd.print(F("["));
+      lcd.print(currentRelayOutputState[r] == HIGH ? RELAY_ON_CHAR : RELAY_OFF_CHAR);
+      lcd.print(F("]["));
+      if (currentRelay.sensor_gate_enabled) {
+        lcd.print(isSensorConditionMet(r) ? SENSOR_ACTIVE_CHAR : SENSOR_INACTIVE_CHAR);
+      } else {
+        lcd.print(SENSOR_INACTIVE_CHAR);
+      }
+      lcd.print(F("]          "));
+      lastDay = 32;
+    } else {
+      if (now.day() != lastDay || needsDisplayUpdate) {
+        lcd.setCursor(0, 1);
+        lcd.print(getDayStr(now.dayOfTheWeek()));
+        lcd.print(F(" "));
+        if (now.day() < 10) lcd.print('0');
+        lcd.print(now.day());
+        lcd.print(F("/"));
+        if (now.month() < 10) lcd.print('0');
+        lcd.print(now.month());
+        lcd.print(F("/"));
+        lcd.print(now.year());
+
+        lastDay = now.day();
+      }
+
+      lcd.setCursor(15, 1);
+      if (settings_changed) {
+        lcd.print(RELAY_ON_CHAR);
+      } else {
+        lcd.print(F(" "));
+      }
+    }
+
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print(F("SAFE MODE           "));
+  }
+}
+
+// **LOGIC TỐI ƯU HIỂN THỊ THỜI GIAN (Đã Sửa Lỗi Dấu Hai Chấm và xóa chữ thừa)**
+void updateHomeTime(bool forceFullDisplayUpdate) {
+  if (!lcd_is_awake) return;  // Không vẽ nếu LCD đang ngủ
+
+  if (!rtc_initialized) {
+    if (forceFullDisplayUpdate) {
+      lcd.setCursor(0, 0);
+      lcd.print(F("SAFE MODE --:--:-- "));
+      updateHomeRelayStatus();
+    }
+    return;
+  }
+
+  if (forceFullDisplayUpdate) {
+    lcd.setCursor(0, 0);
+    printTime(currentTime.hour, currentTime.minute, currentTime.second, true);
+
+    lcd.setCursor(8, 0);
+    lcd.print(F("        "));
+
+  } else {
+    bool showColon = (currentTime.second % 2 != 0);
+
+    if (currentTime.minute != lastMinute) {
+      lcd.setCursor(0, 0);
+      if (currentTime.hour < 10) lcd.print(F("0"));
+      lcd.print(currentTime.hour);
+      lcd.print(F(":"));
+      if (currentTime.minute < 10) lcd.print(F("0"));
+      lcd.print(currentTime.minute);
+      lcd.print(F("    "));
+    }
+
+    lcd.setCursor(5, 0);
+    lcd.print(showColon ? F(":") : F(" "));
+
+    lcd.setCursor(6, 0);
+    if (currentTime.second < 10) lcd.print(F("0"));
+    lcd.print(currentTime.second);
+  }
+
+  updateHomeRelayStatus();
+
+  lcd.noCursor();
+  lcd.noBlink();
+  lastSecond = currentTime.second;
+  lastMinute = currentTime.minute;
+}
+
+void updateDisplay() {
+  unsigned long currentMillis = millis();
+  bool shouldUpdateLcdRateLimited = (currentMillis - lastLcdUpdate >= LCD_UPDATE_INTERVAL);
+
+  if (!lcd_is_awake) return;  // **Bỏ qua update nếu LCD đang ngủ**
+
+
+  if (nav.currentState != MENU_HOME && nav.currentState != MENU_ALERT) {
+    if (!needsDisplayUpdate && !shouldUpdateLcdRateLimited) {
+      return;
+    }
+  }
+
+  if (nav.currentState == MENU_ALERT) {
+    if (currentDisplayedMenu != MENU_ALERT) {
+      lcd.clear();
+      currentDisplayedMenu = MENU_ALERT;
+      lcd.setCursor(0, 0);
+      lcd.print(F("ALERT:"));
+    }
+    lcd.setCursor(0, 1);
+    if (currentAlertMessage != nullptr) {
+      lcd.print(currentAlertMessage);
+    } else if (currentAlertMessageRam[0] != 0) {
+      lcd.print(currentAlertMessageRam);
+    } else {
+      lcd.print(F("UNKNOWN ALERT"));
+    }
+
+    return;
+  }
+
+  if (nav.currentState == MENU_HOME) {
+    if (currentDisplayedMenu != MENU_HOME) {
+      lcd.clear();
+      currentDisplayedMenu = MENU_HOME;
+      needsDisplayUpdate = true;
+      lastMinute = 60;
+      lastDay = 32;
+    }
+
+    bool relayStatusChanged = false;
+    for (uint8_t i = 0; i < NUM_RELAYS; i++) {
+      if (currentRelayOutputState[i] != lastRelayState[i]) {
+        relayStatusChanged = true;
+        break;
+      }
+    }
+
+    bool showQuickSelect = (millis() - lastActionTime < QUICK_SELECT_TIMEOUT) && (lastActionTime != 0);
+    bool isRtcSelected = nav.selectedIndex == NUM_RELAYS;
+
+
+    if (currentTime.second != lastSecond || needsDisplayUpdate || showQuickSelect || relayStatusChanged || isRtcSelected) {
+      updateHomeTime(needsDisplayUpdate || showQuickSelect || relayStatusChanged || isRtcSelected);
+      lastLcdUpdate = currentMillis;
+    }
+    needsDisplayUpdate = false;
+    return;
+  }
+
+  if (needsDisplayUpdate || shouldUpdateLcdRateLimited) {
+    if (currentDisplayedMenu != nav.currentState) {
+      lcd.clear();
+      currentDisplayedMenu = nav.currentState;
+      if (nav.currentState != MENU_RELAY_SETTINGS && nav.currentState != MENU_RTC_EDIT && nav.currentState != MENU_RTC_MAIN_MENU) {
+        lcd.noCursor();
+        lcd.noBlink();
+      }
+    }
+
+    switch (nav.currentState) {
+      case MENU_RELAY_SETTINGS:
+        {
+          uint8_t r_disp = nav.selectedIndex;
+          RelayMenuOption selected = relays[r_disp].selectedOption;
+
+          if (selected >= RELAY_STATUS_OR_TIMER1 && selected <= RELAY_TIMER4 && relays[r_disp].mode != MODE_MAN) {
+            uint8_t t_disp = selected - RELAY_STATUS_OR_TIMER1;
+            if (timers[r_disp][t_disp].setting_step == STEP_DONE) {
+              displayRelayMenu(r_disp);
+            } else {
+              displayTimerMenu(r_disp);
+            }
+          } else {
+            displayRelayMenu(r_disp);
+          }
+        }
+        break;
+      case MENU_RTC_MAIN_MENU:
+        displayRtcMainMenu();
+        break;
+      case MENU_RTC_EDIT:
+        if (currentDisplayedMenu != MENU_RTC_EDIT) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print(F("TIME"));
+          lcd.setCursor(0, 1);
+          lcd.print(F("DATE"));
+          currentDisplayedMenu = MENU_RTC_EDIT;
+        }
+        displayRtcEdit_Dynamic();
+        updateRtcEdit_Cursor();
+        break;
+      case MENU_SAVE_PROMPT:
+        lcd.setCursor(0, 0);
+        lcd.print(F("SETTINGS CHANGED"));
+        lcd.setCursor(0, 1);
+        if (nav.selectedIndex == 0) lcd.print(F("> SAVE DISCARD "));
+        else lcd.print(F(" SAVE > DISCARD"));
+        break;
+      default:
+        break;
+    }
+    needsDisplayUpdate = false;
+    lastLcdUpdate = currentMillis;
+  }
+}
+
+// 11. HÀM EEPROM
+void saveSettings() {
+  for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+    eepromData.relay_mode[r] = relays[r].mode;
+    eepromData.relay_status[r] = relays[r].status;
+    eepromData.sensor_gate_enabled[r] = relays[r].sensor_gate_enabled;
+    eepromData.sensor_logic[r] = relays[r].sensor_logic;
+    for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+      eepromData.timers[r][t].mode = timers[r][t].mode;
+      eepromData.timers[r][t].time_on = timers[r][t].time_on;
+      eepromData.timers[r][t].time_off = timers[r][t].time_off;
+
+      eepromData.timers[r][t].cycle_duration_on = timers[r][t].cycle_duration_on;
+      eepromData.timers[r][t].cycle_duration_off = timers[r][t].cycle_duration_off;
+      eepromData.timers[r][t].cycle_limit = timers[r][t].cycle_limit;
+      eepromData.timers[r][t].cycle_count = timers[r][t].cycle_count;
+      eepromData.timers[r][t].dow_mask = timers[r][t].dow_mask;
+
+      eepromData.timers[r][t].cycle_is_on_state = (uint8_t)timers[r][t].cycle_is_on;
+      eepromData.timers[r][t].cycle_start_time_sec = timers[r][t].cycle_last_state_change_time_seconds;
+    }
+  }
+  eepromData.magic_byte = EEPROM_MAGIC_BYTE;
+  EEPROM.put(0, eepromData);
+  wdt_reset();
+}
+
+void updateCycleCountsInEeprom() {
+  size_t timerArrayAddress = offsetof(EepromData, timers);
+  size_t cycleCountOffset = offsetof(EepromTimerData, cycle_count);
+  size_t timerDataSize = sizeof(EepromTimerData);
+
+  for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+    for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+      int countAddress = timerArrayAddress + (r * NUM_TIMERS_PER_RELAY + t) * timerDataSize + cycleCountOffset;
+
+      if (EEPROM.read(countAddress) != lowByte(timers[r][t].cycle_count) || EEPROM.read(countAddress + 1) != highByte(timers[r][t].cycle_count)) {
+        EEPROM.put(countAddress, timers[r][t].cycle_count);
+      }
+      wdt_reset();
+    }
+  }
+}
+
+void updateCycleResumeStateInEeprom(uint8_t r, uint8_t t) {
+  size_t timerArrayAddress = offsetof(EepromData, timers);
+  size_t timerDataSize = sizeof(EepromTimerData);
+
+  int timerAddress = timerArrayAddress + (r * NUM_TIMERS_PER_RELAY + t) * timerDataSize;
+
+  size_t stateOffset = offsetof(EepromTimerData, cycle_is_on_state);
+  int stateAddress = timerAddress + stateOffset;
+
+  size_t startTimeOffset = offsetof(EepromTimerData, cycle_start_time_sec);
+  int startTimeAddress = timerAddress + startTimeOffset;
+
+  if (timers[r][t].cycle_last_state_change_time_seconds != 0) {
+    uint8_t state = timers[r][t].cycle_is_on ? 1 : 0;
+    uint32_t startTime = timers[r][t].cycle_last_state_change_time_seconds;
+
+    EEPROM.update(stateAddress, state);
+    EEPROM.put(startTimeAddress, startTime);
+  } else if (timers[r][t].cycle_count >= timers[r][t].cycle_limit && timers[r][t].mode == 1 && timers[r][t].cycle_limit != 9999) {
+    EEPROM.update(stateAddress, 0);
+    EEPROM.put(startTimeAddress, (uint32_t)0);
+  } else {
+    EEPROM.update(stateAddress, 0);
+    EEPROM.put(startTimeAddress, (uint32_t)0);
+  }
+  wdt_reset();
+}
+
+
+void updateRelayStatusInEeprom() {
+  size_t statusArrayAddress = offsetof(EepromData, relay_status);
+  for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+    int statusAddress = statusArrayAddress + r;
+    EEPROM.update(statusAddress, relays[r].status);
+  }
+}
+
+void loadSettings() {
+  EEPROM.get(0, eepromData);
+  if (eepromData.magic_byte != EEPROM_MAGIC_BYTE) {
+    return;
+  }
+  for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+    relays[r].mode = eepromData.relay_mode[r];
+    relays[r].status = eepromData.relay_status[r];
+    relays[r].selectedOption = RELAY_BACK;
+    relays[r].sensor_gate_enabled = eepromData.sensor_gate_enabled[r];
+    relays[r].sensor_logic = eepromData.sensor_logic[r];
+
+    for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+      timers[r][t].mode = eepromData.timers[r][t].mode;
+      timers[r][t].time_on = eepromData.timers[r][t].time_on;
+      timers[r][t].time_off = eepromData.timers[r][t].time_off;
+
+      timers[r][t].cycle_duration_on = eepromData.timers[r][t].cycle_duration_on;
+      timers[r][t].cycle_duration_off = eepromData.timers[r][t].cycle_duration_off;
+      timers[r][t].cycle_limit = eepromData.timers[r][t].cycle_limit;
+      timers[r][t].cycle_count = eepromData.timers[r][t].cycle_count;
+
+      timers[r][t].dow_mask = eepromData.timers[r][t].dow_mask;
+
+      timers[r][t].cycle_is_on = (bool)eepromData.timers[r][t].cycle_is_on_state;
+      timers[r][t].cycle_last_state_change_time_seconds = eepromData.timers[r][t].cycle_start_time_sec;
+
+      // **FIX LOGIC CYCLE LIMIT:** Giới hạn tối đa là 99 (hoặc 9999=INF)
+      if (timers[r][t].cycle_limit == 0) {
+        timers[r][t].cycle_limit = 9999;
+      } else if (timers[r][t].cycle_limit > 99 && timers[r][t].cycle_limit != 9999) {
+        timers[r][t].cycle_limit = 99;  // Giới hạn về 99 nếu vượt quá nhưng không phải INF
+        settings_changed = true;
+      }
+
+      if (timers[r][t].cycle_count > 9999) {
+        timers[r][t].cycle_count = 0;
+        settings_changed = true;
+      }
+
+      if (timers[r][t].cycle_limit != 9999 && timers[r][t].cycle_count > timers[r][t].cycle_limit) {
+        timers[r][t].cycle_count = timers[r][t].cycle_limit;
+        timers[r][t].cycle_is_on = false;
+        timers[r][t].cycle_last_state_change_time_seconds = 0;
+        cycle_count_changed = true;
+      }
+
+
+      if (timers[r][t].cycle_duration_on.minute == 0 && timers[r][t].cycle_duration_on.second == 0) {
+        timers[r][t].cycle_duration_on.second = 1;
+        settings_changed = true;
+      }
+      if (timers[r][t].cycle_duration_off.minute == 0 && timers[r][t].cycle_duration_off.second == 0) {
+        timers[r][t].cycle_duration_off.second = 1;
+        settings_changed = true;
+      }
+
+      timers[r][t].cached_on_sec = (uint32_t)timers[r][t].cycle_duration_on.minute * 60 + timers[r][t].cycle_duration_on.second;
+      timers[r][t].cached_off_sec = (uint32_t)timers[r][t].cycle_duration_off.minute * 60 + timers[r][t].cycle_duration_off.second;
+      timers[r][t].cached_time_on_sec = (uint32_t)timers[r][t].time_on.hour * 3600 + (uint32_t)timers[r][t].time_on.minute * 60;
+      timers[r][t].cached_time_off_sec = (uint32_t)timers[r][t].time_off.hour * 3600 + (uint32_t)timers[r][t].time_off.minute * 60;
+
+      timers[r][t].setting_step = STEP_DONE;
+      timers[r][t].selectedOption = TIMER_BACK;
+    }
+  }
+}
+
+void resetSettings() {
+  for (uint8_t r = 0; r < NUM_RELAYS; r++) {
+    if (r == 0 || r == 1) {
+      relays[r].mode = MODE_MAN;
+      relays[r].status = 1;
+    } else if (r == 2) {
+      relays[r].mode = MODE_AUT;
+      relays[r].status = 0;
+    } else if (r == 3) {
+      relays[r].mode = MODE_CYC;
+      relays[r].status = 0;
+    } else {
+      relays[r].mode = MODE_AUT;
+      relays[r].status = 0;
+    }
+
+    relays[r].selectedOption = RELAY_BACK;
+    relays[r].sensor_gate_enabled = false;
+    relays[r].sensor_logic = SENSOR_LOGIC_LOW_ACTIVE;
+
+    for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+      timers[r][t].setting_step = STEP_DONE;
+      timers[r][t].selectedOption = TIMER_BACK;
+      timers[r][t].dow_mask = 0b01111111;
+
+      timers[r][t].cycle_is_on = false;
+      timers[r][t].cycle_last_state_change_time_seconds = 0;
+
+      timers[r][t].mode = 0;
+      timers[r][t].cycle_duration_on.minute = 0;
+      timers[r][t].cycle_duration_on.second = 10;
+      timers[r][t].cycle_duration_off.minute = 0;
+      timers[r][t].cycle_duration_off.second = 5;
+      timers[r][t].cycle_limit = 9999;
+      timers[r][t].cycle_count = 0;
+      timers[r][t].time_on.hour = 8;
+      timers[r][t].time_off.hour = 17;
+      timers[r][t].time_on.minute = 0;
+      timers[r][t].time_off.minute = 0;
+
+      if (t == 0) {
+        if (r == 2) {
+          timers[r][t].mode = 1;
+          timers[r][t].time_on.hour = 11;
+          timers[r][t].time_off.hour = 21;
+          timers[r][t].time_on.minute = 0;
+          timers[r][t].time_off.minute = 0;
+        } else if (r == 3) {
+          timers[r][t].mode = 1;
+          timers[r][t].time_on.hour = 22;
+          timers[r][t].time_off.hour = 22;
+          timers[r][t].time_on.minute = 0;
+          timers[r][t].time_off.minute = 10;
+
+          timers[r][t].cycle_duration_on.minute = 5;
+          timers[r][t].cycle_duration_on.second = 0;
+          timers[r][t].cycle_duration_off.minute = 5;
+          timers[r][t].cycle_duration_off.second = 0;
+          timers[r][t].cycle_limit = 1;
+        } else if (r == 0 || r == 1) {
+          timers[r][t].mode = 0;
+        }
+      }
+
+      timers[r][t].cached_on_sec = (uint32_t)timers[r][t].cycle_duration_on.minute * 60 + timers[r][t].cycle_duration_on.second;
+      timers[r][t].cached_off_sec = (uint32_t)timers[r][t].cycle_duration_off.minute * 60 + timers[r][t].cycle_duration_off.second;
+
+      timers[r][t].cached_time_on_sec = (uint32_t)timers[r][t].time_on.hour * 3600 + (uint32_t)timers[r][t].time_on.minute * 60;
+      timers[r][t].cached_time_off_sec = (uint32_t)timers[r][t].time_off.hour * 3600 + (uint32_t)timers[r][t].time_off.minute * 60;
+    }
+  }
+
+  eepromData.magic_byte = 0;
+  saveSettings();
+  updateCycleCountsInEeprom();
+  updateRelayStatusInEeprom();
+}
+
+
+// 12. LOGIC ĐIỀU KHIỂN RELAY
+int8_t getActiveCycleTimerIndex(uint8_t r, uint32_t currentTimeSeconds) {
+  for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+    if (timers[r][t].mode == 1) {
+
+      uint32_t timeOnSeconds = timers[r][t].cached_time_on_sec;
+      uint32_t timeOffSeconds = timers[r][t].cached_time_off_sec;
+
+      bool isOvernight = (timeOnSeconds >= timeOffSeconds);
+
+      if (!isOvernight) {
+        if ((timers[r][t].dow_mask & currentDayMask) && (currentTimeSeconds >= timeOnSeconds && currentTimeSeconds < timeOffSeconds)) {
+          return t;
+        }
+      } else {
+
+        if (currentTimeSeconds >= timeOnSeconds) {
+          if (timers[r][t].dow_mask & currentDayMask) {
+            return t;
+          }
+        } else if (currentTimeSeconds < timeOffSeconds) {
+          if (timers[r][t].dow_mask & previousDayMask) {
+            return t;
+          }
+        }
+      }
+    }
+  }
+  return -1;
+}
+uint8_t runManualMode(uint8_t r) {
+  return (relays[r].status == 1) ? HIGH : LOW;
+}
+
+uint8_t runAutoTimerMode(uint8_t r, uint32_t currentTimeSeconds) {
+  bool shouldBeOn = false;
+
+  if (!rtc_initialized) return LOW;
+
+  for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+    if (timers[r][t].cycle_last_state_change_time_seconds != 0) {
+      timers[r][t].cycle_last_state_change_time_seconds = 0;
+      timers[r][t].cycle_is_on = false;
+    }
+  }
+
+
+  for (uint8_t t = 0; t < NUM_TIMERS_PER_RELAY; t++) {
+    if (timers[r][t].mode == 1) {
+
+      uint32_t timeOnSeconds = timers[r][t].cached_time_on_sec;
+      uint32_t timeOffSeconds = timers[r][t].cached_time_off_sec;
+
+      bool isOvernight = (timeOnSeconds >= timeOffSeconds);
+
+      if (!isOvernight) {
+        if ((timers[r][t].dow_mask & currentDayMask) == 0) {
+          continue;
+        }
+        if (currentTimeSeconds >= timeOnSeconds && currentTimeSeconds < timeOffSeconds) {
+          shouldBeOn = true;
+          break;
+        }
+      } else {
+
+        if (currentTimeSeconds >= timeOnSeconds) {
+          if ((timers[r][t].dow_mask & currentDayMask) == 0) {
+            continue;
+          }
+          shouldBeOn = true;
+          break;
+        }
+
+        else if (currentTimeSeconds < timeOffSeconds) {
+          if ((timers[r][t].dow_mask & previousDayMask) == 0) {
+            continue;
+          }
+          shouldBeOn = true;
+          break;
+        }
+      }
+    }
+  }
+  return shouldBeOn ? HIGH : LOW;
+}
+
+uint8_t runCycleMode(uint8_t r, int8_t activeTimerIndex, uint32_t currentTimeSeconds) {
+  uint8_t desiredState = LOW;
+
+  if (!rtc_initialized) return LOW;
+
+  if (activeTimerIndex != -1) {
+    uint8_t t = activeTimerIndex;
+    TimerData* timer = &timers[r][t];
+
+    if (timer->cycle_limit != 9999 && timer->cycle_count >= timer->cycle_limit) {
+      if (timer->cycle_last_state_change_time_seconds != 0) {
+        timer->cycle_is_on = false;
+        timer->cycle_last_state_change_time_seconds = 0;
+        updateCycleResumeStateInEeprom(r, t);
+      }
+      return LOW;
+    }
+
+
+    uint32_t onDurationSec = timer->cached_on_sec;
+    uint32_t offDurationSec = timer->cached_off_sec;
+
+    if (timer->cycle_last_state_change_time_seconds == 0) {
+      if (timer->cycle_count < timer->cycle_limit || timer->cycle_limit == 9999) {
+        timer->cycle_is_on = true;
+        timer->cycle_last_state_change_time_seconds = currentTimeSeconds;
+
+        if (timer->cycle_count != cycleCountBuffer[r][t]) {
+          timer->cycle_count = cycleCountBuffer[r][t];
+        }
+      } else {
+        return LOW;
+      }
+    }
+
+    uint32_t elapsed_since_change = currentTimeSeconds - timer->cycle_last_state_change_time_seconds;
+
+    if (timer->cycle_last_state_change_time_seconds > currentTimeSeconds) {
+      elapsed_since_change = (86400 - timer->cycle_last_state_change_time_seconds) + currentTimeSeconds;
+    }
+
+    if (timer->cycle_is_on) {
+      if (elapsed_since_change >= onDurationSec) {
+        timer->cycle_is_on = false;
+        timer->cycle_last_state_change_time_seconds = currentTimeSeconds;
+
+        if (timer->cycle_limit != 9999) {
+          cycleCountBuffer[r][t]++;
+          timers[r][t].cycle_count++;
+
+          if (abs(cycleCountBuffer[r][t] - timers[r][t].cycle_count) >= CYCLE_COUNT_THRESHOLD || cycleCountBuffer[r][t] >= timers[r][t].cycle_limit) {
+            cycle_count_changed = true;
+          }
+        }
+      }
+    } else {
+      if (elapsed_since_change >= offDurationSec) {
+        timer->cycle_is_on = true;
+        timer->cycle_last_state_change_time_seconds = currentTimeSeconds;
+      }
+    }
+
+    desiredState = timer->cycle_is_on ? HIGH : LOW;
+
+  } else {
+    for (uint8_t t_reset = 0; t_reset < NUM_TIMERS_PER_RELAY; t_reset++) {
+      if (timers[r][t_reset].mode == 1) {
+        bool wasActive = timers[r][t_reset].cycle_last_state_change_time_seconds != 0;
+        bool wasCompleted = timers[r][t_reset].cycle_count >= timers[r][t_reset].cycle_limit && timers[r][t_reset].cycle_limit != 9999;
+
+        if (wasActive || wasCompleted) {
+          timers[r][t_reset].cycle_last_state_change_time_seconds = 0;
+          timers[r][t_reset].cycle_is_on = false;
+
+          if (wasCompleted) {
+            timers[r][t_reset].cycle_count = 0;
+            cycleCountBuffer[r][t_reset] = 0;
+            cycle_count_changed = true;
+          }
+
+          updateCycleResumeStateInEeprom(r, t_reset);
+        }
+      }
+    }
+    desiredState = LOW;
+  }
+
+  return desiredState;
+}
+
+
+void runRelay(uint8_t r, uint32_t currentTimeSeconds) {
+  uint8_t pin = relayPins[r];
+  uint8_t desiredState = LOW;
+  int8_t activeTimerIndex = -1;
+
+  if (relays[r].mode == MODE_CYC) {
+    activeTimerIndex = getActiveCycleTimerIndex(r, currentTimeSeconds);
+  }
+
+  switch (relays[r].mode) {
+    case MODE_MAN:
+      desiredState = runManualMode(r);
+      break;
+    case MODE_AUT:
+      desiredState = runAutoTimerMode(r, currentTimeSeconds);
+      break;
+    case MODE_CYC:
+      desiredState = runCycleMode(r, activeTimerIndex, currentTimeSeconds);
+      break;
+    default:
+      desiredState = LOW;
+      break;
+  }
+
+  // Sensor Gate Logic
+  if (relays[r].sensor_gate_enabled) {
+    if (desiredState == HIGH) {
+      bool conditionMet = isSensorConditionMet(r);
+      if (!conditionMet) {
+        desiredState = LOW;
+      }
+    }
+  }
+
+
+  if (currentRelayOutputState[r] != desiredState) {
+    digitalWrite(pin, desiredState);
+    currentRelayOutputState[r] = desiredState;
+  }
+}
+
+// 13. HÀM HỖ TRỢ UX
+bool isSensorConditionMet(uint8_t r) {
+  int reading = digitalRead(SENSOR_PINS[r]);
+
+  if (relays[r].sensor_logic == SENSOR_LOGIC_LOW_ACTIVE) {
+    return (reading == LOW);
+  } else {
+    return (reading == HIGH);
+  }
+}
+
+const __FlashStringHelper* getModeStr(RelayMode mode) {
+  if (mode == MODE_MAN) return F("MAN");
+  if (mode == MODE_AUT) return F("AUT");
+  return F("CYC");
+}
+
+const __FlashStringHelper* getDayStr(uint8_t dayOfWeek) {
+  switch (dayOfWeek) {
+    case 1: return F("T2");
+    case 2: return F("T3");
+    case 3: return F("T4");
+    case 4: return F("T5");
+    case 5: return F("T6");
+    case 6: return F("T7");
+    case 0:
+    default: return F("CN");
+  }
+}
+
+const __FlashStringHelper* getDowMenuStr(uint8_t index) {
+  switch (index) {
+    case 0: return F("T2");
+    case 1: return F("T3");
+    case 2: return F("T4");
+    case 3: return F("T5");
+    case 4: return F("T6");
+    case 5: return F("T7");
+    case 6: return F("CN");
+    case 7: return F("ALL");
+    case 8: return F("NONE");
+    case 9: return F("WKDAY");
+    case 10: return F("BACK");
+    default: return F("--");
+  }
+}
+
+
+void printTime(uint8_t hour, uint8_t minute, uint8_t second, bool includeSeconds) {
+  if (hour < 10) lcd.print(F("0"));
+  lcd.print(hour);
+  lcd.print(F(":"));
+  if (minute < 10) lcd.print(F("0"));
+  lcd.print(minute);
+  if (includeSeconds) {
+    lcd.print(F(":"));
+    if (second < 10) lcd.print(F("0"));
+    lcd.print(second);
+  }
+}
+
+// Hàm showAlert cho chuỗi PROGMEM (chủ yếu là hằng số)
+void showAlert(const __FlashStringHelper* message) {
+  if (nav.currentState != MENU_ALERT) {
+    stateBeforeAlert = nav.currentState;
+  }
+
+  currentAlertMessage = message;
+  currentAlertMessageRam[0] = 0;  // Đảm bảo RAM buffer rỗng
+  alertStartTime = millis();
+  nav.currentState = MENU_ALERT;
+  needsDisplayUpdate = true;
+  lcd.noCursor();
+  lcd.noBlink();
+}
+
+// **MỚI: Hàm showAlert cho chuỗi RAM (thông báo động)**
+void showAlertRam(const char* message) {
+  if (nav.currentState != MENU_ALERT) {
+    stateBeforeAlert = nav.currentState;
+  }
+
+  strncpy(currentAlertMessageRam, message, sizeof(currentAlertMessageRam) - 1);
+  currentAlertMessageRam[sizeof(currentAlertMessageRam) - 1] = 0;
+  currentAlertMessage = nullptr;  // Đảm bảo PROGMEM pointer rỗng
+  alertStartTime = millis();
+  nav.currentState = MENU_ALERT;
+  needsDisplayUpdate = true;
+  lcd.noCursor();
+  lcd.noBlink();
+}
+
+void printCycleTime(uint8_t minute, uint8_t second) {
+  if (minute < 10) lcd.print(F("0"));
+  lcd.print(minute);
+  lcd.print(F("M"));
+  if (second < 10) lcd.print(F("0"));
+  lcd.print(second);
+  lcd.print(F("S"));
+}
+
+void printPaddedLimit(uint16_t limit, bool includeSeconds) {
+  if (limit > 99 && limit != 9999) {
+    limit = 99;
+  }
+
+  if (limit == 9999) {
+    lcd.print(F("INF"));
+    if (includeSeconds) lcd.print(F(" "));
+  } else {
+    if (limit < 10) lcd.print(F("0"));
+    lcd.print(limit);
+    lcd.print(F("  "));
+  }
+}
+
+void updateTimeValue(uint8_t r, uint8_t t, bool isHour, bool isUp, uint8_t step) {
+  uint8_t* valToChange;
+  uint8_t maxVal;
+  if (timers[r][t].selectedOption == TIMER_ON_TIME) {
+    valToChange = isHour ? &timers[r][t].time_on.hour : &timers[r][t].time_on.minute;
+  } else {
+    valToChange = isHour ? &timers[r][t].time_off.hour : &timers[r][t].time_off.minute;
+  }
+  maxVal = isHour ? 23 : 59;
+  if (isUp) {
+    *valToChange = (*valToChange + step > maxVal) ? (*valToChange + step) - (maxVal + 1) : *valToChange + step;
+  } else {
+    *valToChange = (*valToChange < step) ? (maxVal + 1) - (step - *valToChange) : *valToChange - step;
+  }
+  uint8_t col_start_index = (timers[r][t].selectedOption == TIMER_ON_TIME) ? 6 : 7;
+  uint8_t col = isHour ? col_start_index : col_start_index + 3;
+  lcd.setCursor(col, 1);
+  if (*valToChange < 10) lcd.print(F("0"));
+  lcd.print(*valToChange);
+
+  if (timers[r][t].selectedOption == TIMER_ON_TIME) {
+    timers[r][t].cached_time_on_sec = (uint32_t)timers[r][t].time_on.hour * 3600 + (uint32_t)timers[r][t].time_on.minute * 60;
+  } else {
+    timers[r][t].cached_time_off_sec = (uint32_t)timers[r][t].time_off.hour * 3600 + (uint32_t)timers[r][t].time_off.minute * 60;
+  }
+}
+
+void updateDurationValue(uint8_t r, uint8_t t, bool isMinute, bool isUp, uint16_t step) {
+  (void)step;
+  uint8_t* valToChange;
+  uint16_t maxVal;
+  TimerMenuOption currentOption = timers[r][t].selectedOption;
+  TimeDuration* duration = nullptr;
+
+  if (currentOption == TIMER_CYCLE_ON_DUR) {
+    duration = &timers[r][t].cycle_duration_on;
+    valToChange = isMinute ? &duration->minute : &duration->second;
+  } else if (currentOption == TIMER_CYCLE_OFF_DUR) {
+    duration = &timers[r][t].cycle_duration_off;
+    valToChange = isMinute ? &duration->minute : &duration->second;
+  } else {
+    return;
+  }
+
+  maxVal = 59;
+  uint8_t step_size = 1;
+
+  if (isUp) {
+    *valToChange = (*valToChange + step_size > maxVal) ? (*valToChange + step_size) - (maxVal + 1) : *valToChange + step_size;
+  } else {
+    if (*valToChange < step_size) {
+      *valToChange = (maxVal + 1) - (step_size - *valToChange);
+    } else {
+      *valToChange = *valToChange - step_size;
+    }
+  }
+
+  if (duration->minute == 0 && duration->second == 0) {
+    duration->second = 1;
+  }
+
+  lcd.setCursor(6, 1);
+  lcd.print(F("         "));
+  lcd.setCursor(6, 1);
+
+  TimeDuration duration_display = *duration;
+
+  if (currentOption == TIMER_CYCLE_OFF_DUR) lcd.print(F(" "));
+  printCycleTime(duration_display.minute, duration_display.second);
+
+  if (currentOption == TIMER_CYCLE_ON_DUR) {
+    timers[r][t].cached_on_sec = (uint32_t)duration->minute * 60 + duration->second;
+  } else {
+    timers[r][t].cached_off_sec = (uint32_t)duration->minute * 60 + duration->second;
+  }
+}
+
+void updateCountValue(uint8_t r, uint8_t t, bool isUp, uint16_t step) {
+  (void)step;
+  uint16_t* valToChange = &timers[r][t].cycle_limit;
+  uint16_t maxValDisplay = 99;
+  uint16_t currentVal = *valToChange;
+
+  if (currentVal > 99) currentVal = maxValDisplay;
+
+  uint16_t actual_step = 1;
+
+  if (isUp) {
+    if (currentVal == maxValDisplay) {
+      currentVal = 1;
+    } else {
+      currentVal = (currentVal + actual_step > maxValDisplay) ? maxValDisplay : currentVal + actual_step;
+    }
+  } else {
+    if (currentVal == 1 || currentVal == 0) {
+      currentVal = maxValDisplay;
+    } else {
+      if (currentVal < actual_step) {
+        currentVal = 1;
+      } else {
+        currentVal = currentVal - actual_step;
+      }
+    }
+  }
+
+  if (currentVal < 1) currentVal = 1;
+
+  *valToChange = currentVal;
+
+  if (*valToChange < timers[r][t].cycle_count) {
+    timers[r][t].cycle_count = *valToChange;
+    cycleCountBuffer[r][t] = *valToChange;
+  }
+
+  lcd.setCursor(10, 1);
+  lcd.print(F("    "));
+  lcd.setCursor(10, 1);
+  printPaddedLimit(*valToChange, true);
+}
+
+
+void updateCursorPos(uint8_t r, uint8_t t) {
+  if (!lcd_is_awake) return;
+
+  uint8_t col = 0;
+  SettingStep step = timers[r][t].setting_step;
+  TimerMenuOption selected = timers[r][t].selectedOption;
+
+  lcd.cursor();
+  lcd.blink();
+
+  if (selected == TIMER_DOW_SETTING) {
+    if (step != STEP_NAV_TIMER) {
+      lcd.setCursor(3, 1);
+    } else {
+      lcd.noCursor();
+      lcd.noBlink();
+    }
+    return;
+  }
+
+  switch (selected) {
+    case TIMER_ON_TIME:
+    case TIMER_OFF_TIME:
+      col = (selected == TIMER_ON_TIME) ? 6 : 7;
+      if (step == STEP_MM) col += 3;
+      break;
+    case TIMER_CYCLE_ON_DUR:
+    case TIMER_CYCLE_OFF_DUR:
+      col = 9;
+      if (selected == TIMER_CYCLE_OFF_DUR) col += 1;
+      if (step == STEP_MM) col += 4;
+      break;
+    case TIMER_CYCLE_LIMIT:
+      col = 10;
+      break;
+    default:
+      lcd.noCursor();
+      lcd.noBlink();
+      return;
+  }
+
+  if (col > 0) {
+    lcd.setCursor(col, 1);
+  } else {
+    lcd.noCursor();
+    lcd.noBlink();
+  }
+}
+
+// 14. HÀM HIỂN THỊ MENU
+void displayRelayMenu(uint8_t r) {
+  if (!lcd_is_awake) return;
+
+  const __FlashStringHelper* modeStr = getModeStr(relays[r].mode);
+
+  lcd.setCursor(0, 0);
+  lcd.print(F("R"));
+  lcd.print(r + 1);
+  lcd.print(F(": "));
+  lcd.print(modeStr);
+  lcd.print(F(" ("));
+  lcd.print(currentRelayOutputState[r] == HIGH ? RELAY_ON_CHAR : RELAY_OFF_CHAR);
+  lcd.print(F(") "));
+
+  if (relays[r].sensor_gate_enabled) {
+    lcd.print(F("SEN"));
+    if (relays[r].sensor_logic == SENSOR_LOGIC_LOW_ACTIVE) {
+      lcd.print(F("L*"));
+    } else {
+      lcd.print(F("H*"));
+    }
+  } else {
+    lcd.print(F("    "));
+  }
+
+  lcd.noCursor();
+  lcd.noBlink();
+
+  lcd.setCursor(0, 1);
+  lcd.print(F("                "));
+  lcd.setCursor(0, 1);
+
+  lcd.print(F("> "));
+  switch (relays[r].selectedOption) {
+    case RELAY_BACK:
+      lcd.print(F("BACK             "));
+      break;
+    case RELAY_MODE:
+      lcd.print(F("MODE: "));
+      lcd.print(modeStr);
+      lcd.print(F("            "));
+      break;
+    case RELAY_STATUS_OR_TIMER1:
+      if (relays[r].mode == MODE_MAN) {
+        lcd.print(F("STATUS: "));
+        lcd.print(relays[r].status == 1 ? (const __FlashStringHelper*)STR_ON : (const __FlashStringHelper*)STR_OFF);
+        lcd.print(F("           "));
+      } else {
+        lcd.print(F("TIMER 1 "));
+        lcd.print(timers[r][0].mode == 1 ? F("ON ") : F("OFF "));
+        lcd.print(F("           "));
+      }
+      break;
+    case RELAY_TIMER2:
+      if (relays[r].mode != MODE_MAN) {
+        lcd.print(F("TIMER 2 "));
+        lcd.print(timers[r][1].mode == 1 ? F("ON ") : F("OFF "));
+        lcd.print(F("           "));
+      } else {
+        lcd.print(F("TIMER 2 (N/A)   "));
+      }
+      break;
+    case RELAY_TIMER3:
+      if (relays[r].mode != MODE_MAN) {
+        lcd.print(F("TIMER 3 "));
+        lcd.print(timers[r][2].mode == 1 ? F("ON ") : F("OFF "));
+        lcd.print(F("           "));
+      } else {
+        lcd.print(F("TIMER 3 (N/A)   "));
+      }
+      break;
+    case RELAY_TIMER4:
+      if (relays[r].mode != MODE_MAN) {
+        lcd.print(F("TIMER 4 "));
+        lcd.print(timers[r][3].mode == 1 ? F("ON ") : F("OFF "));
+        lcd.print(F("           "));
+      } else {
+        lcd.print(F("TIMER 4 (N/A)   "));
+      }
+      break;
+    case RELAY_SENSOR_GATE:
+      lcd.print(F("SEN GATE: "));
+      lcd.print(relays[r].sensor_gate_enabled ? (const __FlashStringHelper*)STR_ON : (const __FlashStringHelper*)STR_OFF);
+      lcd.print(F("        "));
+      break;
+    case RELAY_SENSOR_LOGIC:
+      lcd.print(F("SEN LOGIC: "));
+      if (relays[r].sensor_logic == SENSOR_LOGIC_LOW_ACTIVE) {
+        lcd.print(F("LOW=ACTV"));
+      } else {
+        lcd.print(F("HIGH=ACTV"));
+      }
+      lcd.print(F("    "));
+      break;
+  }
+}
+
+void displayTimerMenu(uint8_t r) {
+  if (!lcd_is_awake) return;
+
+  uint8_t t = relays[r].selectedOption - RELAY_STATUS_OR_TIMER1;
+  uint16_t currentCount = cycleCountBuffer[r][t];
+  const __FlashStringHelper* timerModeStr = timers[r][t].mode == 1 ? F("ON ") : F("OFF ");
+
+  lcd.setCursor(0, 0);
+  lcd.print(F("R"));
+  lcd.print(r + 1);
+  lcd.print(F("T"));
+  lcd.print(t + 1);
+
+  if (timers[r][t].selectedOption != TIMER_DOW_SETTING) {
+    lcd.print(timerModeStr);
+    if (relays[r].mode == MODE_CYC) {
+      lcd.print(F(" C:"));
+      printPaddedLimit(currentCount, false);
+      lcd.print(F(" "));
+    } else {
+      lcd.print(F("        "));
+    }
+  } else {
+    lcd.print(F(" DOW EDIT"));
+    lcd.print(F("      "));
+  }
+
+
+  lcd.setCursor(0, 1);
+  lcd.print(F("> "));
+  if (timers[r][t].setting_step == STEP_NAV_TIMER) {
+    lcd.noCursor();
+    lcd.noBlink();
+  }
+
+
+  if (timers[r][t].selectedOption == TIMER_BACK) {
+    lcd.print(F("BACK             "));
+  } else if (timers[r][t].selectedOption == TIMER_MODE) {
+    lcd.print(F("MODE: "));
+    lcd.print(timers[r][t].mode == 1 ? (const __FlashStringHelper*)STR_ON : (const __FlashStringHelper*)STR_OFF);
+    lcd.print(F("             "));
+  } else if (timers[r][t].selectedOption == TIMER_DOW_SETTING) {
+    if (timers[r][t].setting_step == STEP_NAV_TIMER) {
+      lcd.print(F("DOW: "));
+      uint8_t mask = timers[r][t].dow_mask;
+      if (mask == 0b01111111) {
+        lcd.print(F("ALL DAYS           "));
+      } else if (mask == 0b00111111) {
+        lcd.print(F("WEEKDAYS           "));
+      } else if (mask == 0x00) {
+        lcd.print(F("NONE               "));
+      } else {
+        lcd.print(F("T:"));
+        for (uint8_t i = 0; i < 7; i++) {
+          if (mask & (1 << i)) {
+            if (i == 6) lcd.print(F("C"));
+            else lcd.print(i + 2);
+          } else lcd.print(F("-"));
+        }
+        lcd.print(F("        "));
+      }
+    } else {
+      uint8_t cursor = dow_cursor[r][t];
+      const __FlashStringHelper* dayStr = getDowMenuStr(cursor);
+
+      if (cursor < 7) {
+        lcd.print(F("["));
+        lcd.print(dayStr);
+        lcd.print(F("] "));
+
+        uint8_t mask = timers[r][t].dow_mask;
+        bool is_on = (mask & (1 << cursor));
+        if (is_on) {
+          lcd.print((const __FlashStringHelper*)STR_ON);
+          lcd.print(RELAY_ON_CHAR);
+        } else {
+          lcd.print((const __FlashStringHelper*)STR_OFF);
+          lcd.print(RELAY_OFF_CHAR);
+        }
+        lcd.print(F("           "));
+        updateCursorPos(r, t);
+      } else {
+        lcd.print(F(" ["));
+        lcd.print(dayStr);
+        lcd.print(F("]          "));
+        updateCursorPos(r, t);
+      }
+    }
+
+  } else if (timers[r][t].selectedOption == TIMER_RESET_COUNT) {
+    if (relays[r].mode == MODE_CYC) {
+      lcd.print(F("RST-C: COUNT "));
+      printPaddedLimit(currentCount, false);
+      lcd.print(F("    "));
+    } else {
+      lcd.print(F("MODE ERR             "));
+    }
+  } else {
+    switch (timers[r][t].selectedOption) {
+      case TIMER_ON_TIME:
+      case TIMER_OFF_TIME:
+        {
+          const __FlashStringHelper* label = (timers[r][t].selectedOption == TIMER_ON_TIME) ? F("ON:") : F("OFF:");
+          TimeOfDay_MinOnly* timeToDisplay = (timers[r][t].selectedOption == TIMER_ON_TIME) ? &timers[r][t].time_on : &timers[r][t].time_off;
+
+          if (relays[r].mode == MODE_AUT || relays[r].mode == MODE_CYC) {
+            lcd.print(label);
+            lcd.print(F("    "));
+            lcd.setCursor(6, 1);
+            if (timeToDisplay->hour < 10) lcd.print(F("0"));
+            lcd.print(timeToDisplay->hour);
+            lcd.print(F(":"));
+            if (timeToDisplay->minute < 10) lcd.print(F("0"));
+            lcd.print(timeToDisplay->minute);
+          } else {
+            lcd.print(F("MODE ERR             "));
+          }
+
+          lcd.print(F("        "));
+
+          if (timers[r][t].setting_step <= STEP_MM) {
+            updateCursorPos(r, t);
+          }
+        }
+        break;
+      case TIMER_CYCLE_ON_DUR:
+      case TIMER_CYCLE_OFF_DUR:
+        {
+          TimeDuration dur = (timers[r][t].selectedOption == TIMER_CYCLE_ON_DUR) ? timers[r][t].cycle_duration_on : timers[r][t].cycle_duration_off;
+
+          if (relays[r].mode == MODE_CYC) {
+            lcd.print((timers[r][t].selectedOption == TIMER_CYCLE_ON_DUR) ? F("ON DUR:") : F("OFF DUR:"));
+            lcd.print(F("  "));
+            lcd.setCursor(9, 1);
+            printCycleTime(dur.minute, dur.second);
+          } else {
+            lcd.print(F("MODE ERR             "));
+          }
+
+          lcd.print(F("    "));
+          if (timers[r][t].setting_step != STEP_NAV_TIMER) {
+            updateCursorPos(r, t);
+          }
+        }
+        break;
+      case TIMER_CYCLE_LIMIT:
+        {
+          if (relays[r].mode == MODE_CYC) {
+            lcd.print(F("LIMIT: "));
+            lcd.print(F("        "));
+            lcd.setCursor(7, 1);
+            printPaddedLimit(timers[r][t].cycle_limit, true);
+          } else {
+            lcd.print(F("MODE ERR             "));
+          }
+
+          if (timers[r][t].setting_step != STEP_NAV_TIMER) {
+            updateCursorPos(r, t);
+          }
+        }
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+// 15. CÁC HÀM RTC
+void displayRtcMainMenu() {
+  if (!lcd_is_awake) return;
+
+  lcd.setCursor(0, 0);
+  lcd.print(F("CHON CAI DAT RTC:"));
+
+  lcd.setCursor(0, 1);
+  lcd.print(F("                "));
+
+  lcd.setCursor(1, 1);
+  switch (rtcMenuOption) {
+    case RTC_MENU_TIME:
+      lcd.print(F("TIME SETTING"));
+      break;
+    case RTC_MENU_DATE:
+      lcd.print(F("DATE SETTING"));
+      break;
+    case RTC_MENU_BACK:
+      lcd.print(F("BACK"));
+      break;
+  }
+
+  lcd.setCursor(0, 1);
+  lcd.print(F(">"));
+  lcd.noCursor();
+  lcd.noBlink();
+}
+
+void displayRtcEdit_Dynamic() {
+  if (!lcd_is_awake) return;
+
+  lcd.setCursor(5, 0);
+  if (rtc_temp_time.hour() < 10) lcd.print(F("0"));
+  lcd.print(rtc_temp_time.hour());
+  lcd.print(F(":"));
+  if (rtc_temp_time.minute() < 10) lcd.print(F("0"));
+  lcd.print(rtc_temp_time.minute());
+
+  if (rtcEditStep == RTC_EDIT_SAVE) {
+    lcd.setCursor(11, 0);
+    lcd.print(F("[LUU]"));
+  } else if (rtcEditStep == RTC_EDIT_CANCEL) {
+    lcd.setCursor(11, 0);
+    lcd.print(F("[HUY]"));
+  } else if (rtcEditStep == RTC_EDIT_BACK) {
+    lcd.setCursor(11, 0);
+    lcd.print(F("[BACK]"));
+  } else {
+    lcd.setCursor(11, 0);
+    lcd.print(F("     "));
+  }
+
+  lcd.setCursor(5, 1);
+  if (rtc_temp_time.day() < 10) lcd.print(F("0"));
+  lcd.print(rtc_temp_time.day());
+  lcd.print(F("/"));
+  if (rtc_temp_time.month() < 10) lcd.print(F("0"));
+  lcd.print(rtc_temp_time.month());
+  lcd.print(F("/"));
+  uint16_t y = rtc_temp_time.year() % 100;
+  if (y < 10) lcd.print(F("0"));
+  lcd.print(y);
+}
+
+void updateRtcEdit_Cursor() {
+  if (!lcd_is_awake) return;
+
+  lcd.cursor();
+  lcd.blink();
+
+  if (rtcEditStep <= RTC_EDIT_YY) {
+    switch (rtcEditStep) {
+      case RTC_EDIT_HH: lcd.setCursor(5, 0); break;
+      case RTC_EDIT_MM: lcd.setCursor(8, 0); break;
+      case RTC_EDIT_DD: lcd.setCursor(5, 1); break;
+      case RTC_EDIT_MO: lcd.setCursor(8, 1); break;
+      case RTC_EDIT_YY: lcd.setCursor(11, 1); break;
+      default: break;
+    }
+  } else {
+    lcd.setCursor(12, 0);
+    lcd.blink();
+  }
+}
+
+// 16. HÀM XỬ LÝ NÚT NHẤN (Sử dụng Cờ Ngắt cho Polling)
+void handleButtons() {
+  unsigned long currentMillis = millis();
+
+  auto checkButton = [&](uint8_t pin, volatile bool& flag, int index, void (*handler)(unsigned long)) {
+    if (flag) {
+      int reading = digitalRead(pin);
+      if (reading != lastButtonState[index]) {
+        if ((currentMillis - interruptEndTime) > DEBOUNCING_TIME) {
+          if (reading == LOW) {
+          } else {
+            // **Đánh thức LCD khi có click**
+            wakeLcd();
+            handler(currentMillis);
+            buttonClickProcessed = false;
+            interruptEndTime = currentMillis;
+          }
+          lastButtonState[index] = reading;
+          flag = false;
+        }
+      }
+    }
+  };
+
+  checkButton(BUTTON_UP_PIN, buttonUpFlag, 0, handleButtonUp);
+  checkButton(BUTTON_DOWN_PIN, buttonDownFlag, 2, handleButtonDown);
+
+  // Xử lý nút SELECT (Giữ lại logic Hold)
+  if (buttonSelectFlag) {
+    int reading = digitalRead(BUTTON_SELECT_PIN);
+    if (reading != lastButtonState[1]) {
+      if ((currentMillis - interruptEndTime) > DEBOUNCING_TIME) {
+        if (reading == LOW) {
+          pressSelectStartTime = currentMillis;
+          isHoldingSelect = false;
+          buttonClickProcessed = false;
+        } else {
+          // **Đánh thức LCD khi có click**
+          wakeLcd();
+          if (!isHoldingSelect && !buttonClickProcessed) {
+            handleButtonSelect_Click();
+          }
+          isHoldingSelect = false;
+          buttonClickProcessed = false;
+          interruptEndTime = currentMillis;
+        }
+        lastButtonState[1] = reading;
+        buttonSelectFlag = false;
+      }
+    }
+  }
+
+  // Logic Hold cho SELECT (Quick Manual Toggle/Cycle Override)
+  if (digitalRead(BUTTON_SELECT_PIN) == LOW && lcd_is_awake) {  // **Chỉ xử lý Hold khi LCD đang bật**
+    if (!isHoldingSelect) {
+      const unsigned long NEW_HOLD_START_DELAY = 500;
+
+      if ((currentMillis - pressSelectStartTime) >= NEW_HOLD_START_DELAY) {
+
+        // 1. Logic Quick Manual Toggle (GIỮ LẠI)
+        if (nav.currentState == MENU_HOME && nav.selectedIndex < NUM_RELAYS && relays[nav.selectedIndex].mode == MODE_MAN) {
+          handleButtonSelect_Hold(false);
+          if (buttonClickProcessed) {
+            isHoldingSelect = true;
+            return;
+          }
+        }
+
+        // 2. Logic Cycle Override (GIỮ LẠI)
+        if (nav.currentState == MENU_RELAY_SETTINGS) {
+          uint8_t r_ = nav.selectedIndex;
+          RelayMenuOption currentSetting_ = relays[r_].selectedOption;
+          uint8_t t_ = currentSetting_ - RELAY_STATUS_OR_TIMER1;
+
+          bool isEditingTimer_ = (currentSetting_ >= RELAY_STATUS_OR_TIMER1 && currentSetting_ <= RELAY_TIMER4) && (timers[r_][t_].setting_step != STEP_DONE && timers[r_][t_].setting_step != STEP_NAV_TIMER);
+
+          if (isEditingTimer_) {
+            const unsigned long OVERRIDE_HOLD_TIME_LOCAL = 1500;
+            if ((currentMillis - pressSelectStartTime) >= OVERRIDE_HOLD_TIME_LOCAL) {
+
+              handleButtonSelect_Hold(true);
+              if (buttonClickProcessed) {
+                isHoldingSelect = true;
+                return;
+              }
+            }
+          }
+        }
+      }
+    }
+
+  } else {
+    isHoldingSelect = false;
+  }
+}
+
+
+// 17. HÀM HÀNH ĐỘNG CỦA NÚT NHẤN
+void handleButtonUp(unsigned long currentMillis) {
+  if (!lcd_is_awake) return;
+
+  lastActionTime = currentMillis;
+  needsDisplayUpdate = true;
+  uint16_t step = 1;
+
+  uint8_t r, t;
+  RelayMenuOption selected;
+
+  if (nav.currentState == MENU_RELAY_SETTINGS) {
+    r = nav.selectedIndex;
+    selected = relays[r].selectedOption;
+    if (selected >= RELAY_STATUS_OR_TIMER1 && selected <= RELAY_TIMER4) {
+      t = selected - RELAY_STATUS_OR_TIMER1;
+      if (timers[r][t].setting_step != STEP_DONE && timers[r][t].setting_step != STEP_NAV_TIMER) {
+        if (timers[r][t].mode == 1 && timers[r][t].cycle_last_state_change_time_seconds != 0) {
+          showAlert(F("TIMER IS ACTIVE!"));
+          return;
+        }
+      }
+    }
+  }
+
+  switch (nav.currentState) {
+    case MENU_HOME:
+      {
+        const uint8_t HOME_MAX_INDEX = NUM_RELAYS;
+        if (nav.selectedIndex <= 0) {
+          nav.selectedIndex = HOME_MAX_INDEX;
+        } else {
+          nav.selectedIndex--;
+        }
+      }
+      currentDisplayedMenu = (MenuState)0xFF;
+      lastSecond = 60;
+      lastDay = 32;
+      break;
+
+    case MENU_RTC_MAIN_MENU:
+      rtcMenuOption = (RtcMenuOption)((rtcMenuOption == RTC_MENU_TIME) ? RTC_MENU_BACK : (uint8_t)rtcMenuOption - 1);
+      break;
+
+    case MENU_RELAY_SETTINGS:
+      r = nav.selectedIndex;
+      selected = relays[r].selectedOption;
+
+      if (selected >= RELAY_STATUS_OR_TIMER1 && selected <= RELAY_TIMER4 && relays[r].mode != MODE_MAN) {
+        t = selected - RELAY_STATUS_OR_TIMER1;
+        SettingStep currentStep = timers[r][t].setting_step;
+
+        if (currentStep == STEP_DONE) {
+          navigateRelaySettings(r, true);
+        } else if (currentStep == STEP_NAV_TIMER) {
+          navigateTimerMenu(r, t, true);
+        } else {
+          navigateSettingValue(r, t, true, step);
+          settings_changed = true;
+          lastSettingsChangeTime = currentMillis;
+          updateCursorPos(r, t);
+        }
+      } else {
+        navigateRelaySettings(r, true);
+      }
+      break;
+
+    case MENU_SAVE_PROMPT:
+      navigateSavePrompt(true);
+      break;
+    case MENU_RTC_EDIT:
+      navigateRtcEdit(true, step);
+      break;
+
+    default:
+      needsDisplayUpdate = false;
+      break;
+  }
+}
+
+void handleButtonDown(unsigned long currentMillis) {
+  if (!lcd_is_awake) return;
+
+  lastActionTime = currentMillis;
+  needsDisplayUpdate = true;
+  uint16_t step = 1;
+
+  uint8_t r, t;
+  RelayMenuOption selected;
+
+  if (nav.currentState == MENU_RELAY_SETTINGS) {
+    r = nav.selectedIndex;
+    selected = relays[r].selectedOption;
+    if (selected >= RELAY_STATUS_OR_TIMER1 && selected <= RELAY_TIMER4) {
+      t = selected - RELAY_STATUS_OR_TIMER1;
+      if (timers[r][t].setting_step != STEP_DONE && timers[r][t].setting_step != STEP_NAV_TIMER) {
+        if (timers[r][t].mode == 1 && timers[r][t].cycle_last_state_change_time_seconds != 0) {
+          showAlert(F("TIMER IS ACTIVE!"));
+          return;
+        }
+      }
+    }
+  }
+
+  switch (nav.currentState) {
+    case MENU_HOME:
+      {
+        const uint8_t HOME_MAX_INDEX_DOWN = NUM_RELAYS;
+        nav.selectedIndex = (nav.selectedIndex + 1) % (HOME_MAX_INDEX_DOWN + 1);
+      }
+      currentDisplayedMenu = (MenuState)0xFF;
+      lastSecond = 60;
+      lastDay = 32;
+      break;
+
+    case MENU_RTC_MAIN_MENU:
+      rtcMenuOption = (RtcMenuOption)((rtcMenuOption == RTC_MENU_BACK) ? RTC_MENU_TIME : (uint8_t)rtcMenuOption + 1);
+      break;
+
+    case MENU_RELAY_SETTINGS:
+      r = nav.selectedIndex;
+      selected = relays[r].selectedOption;
+
+      if (selected >= RELAY_STATUS_OR_TIMER1 && selected <= RELAY_TIMER4 && relays[r].mode != MODE_MAN) {
+        t = selected - RELAY_STATUS_OR_TIMER1;
+        SettingStep currentStep = timers[r][t].setting_step;
+
+        if (currentStep == STEP_DONE) {
+          navigateRelaySettings(r, false);
+        } else if (currentStep == STEP_NAV_TIMER) {
+          navigateTimerMenu(r, t, false);
+        } else {
+          navigateSettingValue(r, t, false, step);
+          settings_changed = true;
+          lastSettingsChangeTime = currentMillis;
+          updateCursorPos(r, t);
+        }
+      } else {
+        navigateRelaySettings(r, false);
+      }
+      break;
+
+    case MENU_SAVE_PROMPT:
+      navigateSavePrompt(false);
+      break;
+    case MENU_RTC_EDIT:
+      navigateRtcEdit(false, step);
+      break;
+
+    default:
+      needsDisplayUpdate = false;
+      break;
+  }
+}
+
+void handleButtonSelect_Click() {
+  if (!lcd_is_awake) return;
+
+  lastActionTime = millis();
+  needsDisplayUpdate = true;
+  uint8_t r, t;
+  MenuState s = nav.currentState;
+
+  switch (s) {
+    case MENU_HOME:
+      if (nav.selectedIndex == NUM_RELAYS) {
+        nav.currentState = MENU_RTC_MAIN_MENU;
+        rtcMenuOption = RTC_MENU_TIME;
+        needsDisplayUpdate = true;
+      } else {
+        nav.currentState = MENU_RELAY_SETTINGS;
+        relays[nav.selectedIndex].selectedOption = RELAY_BACK;
+      }
+      break;
+
+    case MENU_RTC_MAIN_MENU:
+      if (rtcMenuOption == RTC_MENU_TIME) {
+        nav.currentState = MENU_RTC_EDIT;
+        rtcEditStep = RTC_EDIT_HH;
+        now = RTC.now();
+        rtc_temp_time = now;
+      } else if (rtcMenuOption == RTC_MENU_DATE) {
+        nav.currentState = MENU_RTC_EDIT;
+        rtcEditStep = RTC_EDIT_DD;
+        now = RTC.now();
+        rtc_temp_time = now;
+      } else {
+        nav.currentState = MENU_HOME;
+        nav.selectedIndex = 0;
+      }
+      needsDisplayUpdate = true;
+      break;
+
+    case MENU_RELAY_SETTINGS:
+      r = nav.selectedIndex;
+      if (relays[r].selectedOption >= RELAY_STATUS_OR_TIMER1 && relays[r].selectedOption <= RELAY_TIMER4 && relays[r].mode != MODE_MAN) {
+        t = relays[r].selectedOption - RELAY_STATUS_OR_TIMER1;
+        if (timers[r][t].setting_step != STEP_DONE) {
+          selectTimerSettings(r, t);
+          break;
+        }
+      }
+      selectRelaySettings(r);
+      break;
+    case MENU_RTC_EDIT:
+      selectRtcEdit();
+      break;
+    case MENU_SAVE_PROMPT:
+      selectSavePrompt();
+      break;
+    default:
+      needsDisplayUpdate = false;
+      break;
+  }
+}
+
+void handleButtonSelect_Hold(bool checkCycleReset) {
+  if (!lcd_is_awake) return;
+
+  unsigned long currentMillis = millis();
+  lastActionTime = currentMillis;
+  needsDisplayUpdate = true;
+  MenuState s = nav.currentState;
+
+  uint8_t r = nav.selectedIndex;
+  RelayMenuOption currentSetting = relays[r].selectedOption;
+  uint8_t t = 0;
+
+  const unsigned long NEW_HOLD_START_DELAY = 500;
+
+  // 1. Quick Manual Toggle (GIỮ LẠI)
+  if (s == MENU_HOME) {
+    if ((currentMillis - pressSelectStartTime) >= NEW_HOLD_START_DELAY && !isHoldingSelect) {
+      if (relays[r].mode == MODE_MAN) {
+        relays[r].status = 1 - relays[r].status;
+        updateRelayStatusInEeprom();
+
+        const __FlashStringHelper* statusMsg = (relays[r].status == 1) ? F("ON") : F("OFF");
+        char alertBuffer[16];
+        // Sử dụng snprintf_P an toàn, sau đó truyền kết quả (chuỗi RAM) vào showAlertRam
+        snprintf_P(alertBuffer, sizeof(alertBuffer), (const char*)F("R%d %S!"), r + 1, statusMsg);
+        showAlertRam(alertBuffer);  // **SỬA LỖI: Gọi hàm showAlertRam**
+
+        isHoldingSelect = true;
+        buttonClickProcessed = true;
+        return;
+      }
+    }
+  }
+
+  // 2. Cycle Override (GIỮ LẠI)
+  if (s == MENU_RELAY_SETTINGS) {
+    if (currentSetting >= RELAY_STATUS_OR_TIMER1 && currentSetting <= RELAY_TIMER4) {
+      t = currentSetting - RELAY_STATUS_OR_TIMER1;
+      if (timers[r][t].setting_step != STEP_DONE && timers[r][t].setting_step != STEP_NAV_TIMER) {
+        bool checkTimerActive = timers[r][t].mode == 1 && timers[r][t].cycle_last_state_change_time_seconds != 0;
+
+        if (checkTimerActive) {
+          const unsigned long OVERRIDE_HOLD_TIME_LOCAL = 1500;
+          if ((currentMillis - pressSelectStartTime) >= OVERRIDE_HOLD_TIME_LOCAL) {
+            showAlert((const __FlashStringHelper*)MSG_OVERRIDE_OK);
+            timers[r][t].cycle_last_state_change_time_seconds = currentTimeSeconds;
+            timers[r][t].cycle_is_on = true;
+            updateCycleResumeStateInEeprom(r, t);
+            isHoldingSelect = true;
+            buttonClickProcessed = true;
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+void navigateRelaySettings(uint8_t r, bool isUp) {
+  uint8_t max_option_index = 7;
+
+  RelayMenuOption current = relays[r].selectedOption;
+  RelayMenuOption next_option = current;
+  RelayMode mode = relays[r].mode;
+
+  if (isUp) {
+    if (current == RELAY_BACK) {
+      next_option = (RelayMenuOption)max_option_index;
+    } else {
+      next_option = (RelayMenuOption)(current - 1);
+    }
+  } else {
+    if (current == (RelayMenuOption)max_option_index) {
+      next_option = RELAY_BACK;
+    } else {
+      next_option = (RelayMenuOption)(current + 1);
+    }
+  }
+
+  if (mode == MODE_MAN) {
+    if (isUp) {
+      if (next_option >= RELAY_TIMER2 && next_option <= RELAY_TIMER4) {
+        next_option = RELAY_STATUS_OR_TIMER1;
+      } else if (current == RELAY_SENSOR_GATE && next_option == RELAY_TIMER4) {
+        next_option = RELAY_STATUS_OR_TIMER1;
+      }
+    } else {
+      if (next_option >= RELAY_TIMER2 && next_option <= RELAY_TIMER4) {
+        next_option = RELAY_SENSOR_GATE;
+      } else if (current == RELAY_STATUS_OR_TIMER1 && next_option == RELAY_TIMER2) {
+        next_option = RELAY_SENSOR_GATE;
+      }
+    }
+  }
+
+  relays[r].selectedOption = next_option;
+}
+
+
+void navigateSettingValue(uint8_t r, uint8_t t, bool isUp, uint16_t step) {
+  (void)step;
+  TimerMenuOption selected = timers[r][t].selectedOption;
+  SettingStep currentStep = timers[r][t].setting_step;
+
+  switch (selected) {
+    case TIMER_ON_TIME:
+    case TIMER_OFF_TIME:
+      updateTimeValue(r, t, (currentStep == STEP_HH_OR_VALUE), isUp, 1);
+      break;
+    case TIMER_CYCLE_ON_DUR:
+    case TIMER_CYCLE_OFF_DUR:
+      updateDurationValue(r, t, (currentStep == STEP_HH_OR_VALUE), isUp, 1);
+      break;
+    case TIMER_CYCLE_LIMIT:
+      updateCountValue(r, t, isUp, 1);
+      break;
+    case TIMER_DOW_SETTING:
+      if (currentStep != STEP_NAV_TIMER) {
+        uint8_t max_cursor = 10;
+        if (isUp) {
+          dow_cursor[r][t] = (dow_cursor[r][t] == 0) ? max_cursor : dow_cursor[r][t] - 1;
+        } else {
+          dow_cursor[r][t] = (dow_cursor[r][t] == max_cursor) ? 0 : dow_cursor[r][t] + 1;
+        }
+      }
+      break;
+    case TIMER_RESET_COUNT:
+      break;
+    default:
+      return;
+  }
+}
+
+void navigateTimerMenu(uint8_t r, uint8_t t, bool isUp) {
+  TimerMenuOption current = timers[r][t].selectedOption;
+  TimerMenuOption next_option;
+
+  TimerMenuOption max_option = TIMER_RESET_COUNT;
+
+  if (isUp) {
+    next_option = (current == TIMER_BACK) ? max_option : (TimerMenuOption)((uint8_t)current - 1);
+  } else {
+    next_option = (current == max_option) ? TIMER_BACK : (TimerMenuOption)((uint8_t)current + 1);
+  }
+
+  if (relays[r].mode == MODE_AUT) {
+    if (next_option >= TIMER_CYCLE_ON_DUR && next_option <= TIMER_RESET_COUNT) {
+      if (isUp) {
+        next_option = TIMER_OFF_TIME;
+      } else {
+        next_option = TIMER_BACK;
+      }
+    }
+  }
+
+  timers[r][t].selectedOption = next_option;
+}
+
+
+void navigateSavePrompt(bool isUp) {
+  (void)isUp;
+  nav.selectedIndex = 1 - nav.selectedIndex;
+}
+
+void navigateRtcEdit(bool isUp, uint16_t step) {
+  (void)step;
+
+  uint16_t y = rtc_temp_time.year();
+  uint8_t m = rtc_temp_time.month();
+  uint8_t d = rtc_temp_time.day();
+  uint8_t h = rtc_temp_time.hour();
+  uint8_t min = rtc_temp_time.minute();
+
+  uint8_t daysInMonth[] = { 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  if (y % 400 == 0 || (y % 4 == 0 && y % 100 != 0)) {
+    daysInMonth[2] = 29;
+  }
+
+  uint16_t actual_step = 1;
+
+  switch (rtcEditStep) {
+    case RTC_EDIT_HH:
+      h = isUp ? (h + actual_step) % 24 : (h < actual_step ? 24 - (actual_step - h) : h - actual_step);
+      break;
+    case RTC_EDIT_MM:
+      min = isUp ? (min + actual_step > 59 ? (min + actual_step) - 60 : min + actual_step) : (min < actual_step ? (60 - (actual_step - min)) : (min - actual_step));
+      break;
+    case RTC_EDIT_DD:
+      {
+        uint8_t max_days = daysInMonth[m];
+
+        if (isUp) {
+          d = ((d + actual_step - 1) % max_days) + 1;
+        } else {
+          d = ((d - 1 + max_days - actual_step) % max_days) + 1;
+        }
+      }
+      break;
+    case RTC_EDIT_MO:
+      {
+        if (isUp) {
+          m = ((m + actual_step - 1) % 12) + 1;
+        } else {
+          m = ((m - 1 + 12 - actual_step) % 12) + 1;
+        }
+      }
+      break;
+    case RTC_EDIT_YY:
+      {
+        uint16_t y_short = y % 100;
+        uint16_t step_short = actual_step;
+
+        if (isUp) {
+          y_short = (y_short + step_short) % 100;
+        } else {
+          if (y_short < step_short) {
+            y_short = 100 + (y_short - step_short);
+          } else {
+            y_short = y_short - step_short;
+          }
+        }
+        y = 2000 + y_short;
+        if (y < 2000) y = 2000;
+        if (y > 2099) y = 2099;
+      }
+      break;
+    case RTC_EDIT_SAVE:
+    case RTC_EDIT_CANCEL:
+    case RTC_EDIT_BACK:
+      if (isUp) {
+        if (rtcEditStep == RTC_EDIT_SAVE) {
+          rtcEditStep = RTC_EDIT_BACK;
+        } else if (rtcEditStep == RTC_EDIT_BACK) {
+          rtcEditStep = RTC_EDIT_CANCEL;
+        } else {
+          rtcEditStep = RTC_EDIT_SAVE;
+        }
+      } else {
+        if (rtcEditStep == RTC_EDIT_SAVE) {
+          rtcEditStep = RTC_EDIT_CANCEL;
+        } else if (rtcEditStep == RTC_EDIT_CANCEL) {
+          rtcEditStep = RTC_EDIT_BACK;
+        } else {
+          rtcEditStep = RTC_EDIT_SAVE;
+        }
+      }
+      break;
+  }
+
+  if (rtcEditStep == RTC_EDIT_MO || rtcEditStep == RTC_EDIT_YY) {
+    if (y % 400 == 0 || (y % 4 == 0 && y % 100 != 0)) {
+      daysInMonth[2] = 29;
+    } else {
+      daysInMonth[2] = 28;
+    }
+  }
+
+  if (m > 0 && d > daysInMonth[m]) {
+    d = daysInMonth[m];
+  }
+
+  if (m == 0) m = 1;
+
+  rtc_temp_time = DateTime(y, m, d, h, min, 0);
+}
+
+void selectRtcEdit() {
+  if (rtcEditStep == RTC_EDIT_SAVE) {
+    rtc_temp_time = DateTime(rtc_temp_time.year(), rtc_temp_time.month(), rtc_temp_time.day(),
+                             rtc_temp_time.hour(), rtc_temp_time.minute(), 0);
+    RTC.adjust(rtc_temp_time);
+    now = RTC.now();
+    nav.currentState = MENU_HOME;
+    nav.selectedIndex = 0;
+    lcd.noCursor();
+    lcd.noBlink();
+  } else if (rtcEditStep == RTC_EDIT_CANCEL) {
+    nav.currentState = MENU_HOME;
+    nav.selectedIndex = 0;
+    lcd.noCursor();
+    lcd.noBlink();
+  } else if (rtcEditStep == RTC_EDIT_BACK) {
+    nav.currentState = MENU_HOME;
+    nav.selectedIndex = 0;
+    lcd.noCursor();
+    lcd.noBlink();
+  } else {
+    uint8_t nextStep = (uint8_t)rtcEditStep + 1;
+
+    if (rtcMenuOption == RTC_MENU_TIME) {
+      if (rtcEditStep == RTC_EDIT_HH) nextStep = RTC_EDIT_MM;
+      else if (rtcEditStep == RTC_EDIT_MM) nextStep = RTC_EDIT_SAVE;
+      else nextStep = RTC_EDIT_HH;
+    } else if (rtcMenuOption == RTC_MENU_DATE) {
+      if (rtcEditStep == RTC_EDIT_DD) nextStep = RTC_EDIT_MO;
+      else if (rtcEditStep == RTC_EDIT_MO) nextStep = RTC_EDIT_YY;
+      else if (rtcEditStep == RTC_EDIT_YY) nextStep = RTC_EDIT_SAVE;
+      else nextStep = RTC_EDIT_DD;
+    } else {
+      if (nextStep > (uint8_t)RTC_EDIT_BACK) {
+        nextStep = (uint8_t)RTC_EDIT_HH;
+      }
+    }
+
+    rtcEditStep = (RtcEditStep)nextStep;
+  }
+}
+
+
+void selectRelaySettings(uint8_t r) {
+  if (relays[r].selectedOption == RELAY_BACK) {
+    nav.currentState = MENU_HOME;
+    nav.selectedIndex = 0;
+    lcd.noCursor();
+    lcd.noBlink();
+  } else if (relays[r].selectedOption == RELAY_MODE) {
+    relays[r].mode = (RelayMode)((relays[r].mode + 1) % 3);
+    settings_changed = true;
+    lastSettingsChangeTime = millis();
+    relays[r].status = 0;
+    relays[r].selectedOption = RELAY_STATUS_OR_TIMER1;
+  } else if (relays[r].selectedOption == RELAY_STATUS_OR_TIMER1 && relays[r].mode == MODE_MAN) {
+    relays[r].status = 1 - relays[r].status;
+    updateRelayStatusInEeprom();
+  } else if (relays[r].selectedOption == RELAY_SENSOR_GATE) {
+    relays[r].sensor_gate_enabled = !relays[r].sensor_gate_enabled;
+    settings_changed = true;
+    lastSettingsChangeTime = millis();
+  } else if (relays[r].selectedOption == RELAY_SENSOR_LOGIC) {
+    relays[r].sensor_logic = (SensorLogic)(1 - relays[r].sensor_logic);
+    settings_changed = true;
+    lastSettingsChangeTime = millis();
+  } else if (relays[r].selectedOption >= RELAY_STATUS_OR_TIMER1 && relays[r].selectedOption <= RELAY_TIMER4 && relays[r].mode != MODE_MAN) {
+    uint8_t t = relays[r].selectedOption - RELAY_STATUS_OR_TIMER1;
+    timers[r][t].setting_step = STEP_NAV_TIMER;
+    timers[r][t].selectedOption = TIMER_MODE;
+
+    currentDisplayedMenu = (MenuState)0xFF;
+    updateDisplay();
+  }
+}
+
+void selectTimerSettings(uint8_t r, uint8_t t) {
+
+  if (timers[r][t].selectedOption == TIMER_BACK) {
+    timers[r][t].setting_step = STEP_DONE;
+    lcd.noCursor();
+    lcd.noBlink();
+    relays[r].selectedOption = (RelayMenuOption)(t + RELAY_STATUS_OR_TIMER1);
+
+  } else if (timers[r][t].selectedOption == TIMER_MODE) {
+    timers[r][t].mode = 1 - timers[r][t].mode;
+    if (timers[r][t].mode == 0) {
+      timers[r][t].cycle_count = 0;
+      cycleCountBuffer[r][t] = 0;
+      timers[r][t].cycle_last_state_change_time_seconds = 0;
+    } else {
+      if (relays[r].mode == MODE_AUT || relays[r].mode == MODE_CYC) {
+        if (timers[r][t].cached_time_on_sec == timers[r][t].cached_time_off_sec) {
+          timers[r][t].mode = 0;
+          showAlert((const __FlashStringHelper*)MSG_ON_OFF_ERROR);
+          needsDisplayUpdate = true;
+        }
+      }
+    }
+    settings_changed = true;
+    lastSettingsChangeTime = millis();
+
+  } else if (timers[r][t].selectedOption == TIMER_DOW_SETTING) {
+    if (timers[r][t].setting_step == STEP_NAV_TIMER) {
+      timers[r][t].setting_step = STEP_HH_OR_VALUE;
+      dow_cursor[r][t] = 0;
+      currentDisplayedMenu = (MenuState)0xFF;
+    } else {
+
+      uint8_t cursor = dow_cursor[r][t];
+
+      if (cursor < 7) {
+        timers[r][t].dow_mask ^= (1 << cursor);
+        settings_changed = true;
+      } else if (cursor == 7) {
+        timers[r][t].dow_mask = 0b01111111;
+        settings_changed = true;
+      } else if (cursor == 8) {
+        timers[r][t].dow_mask = 0b00000000;
+        settings_changed = true;
+      } else if (cursor == 9) {
+        timers[r][t].dow_mask = 0b00111111;
+        settings_changed = true;
+      } else if (cursor == 10) {
+        timers[r][t].setting_step = STEP_NAV_TIMER;
+        lcd.noCursor();
+        lcd.noBlink();
+      }
+
+      if (settings_changed) {
+        lastSettingsChangeTime = millis();
+      }
+    }
+
+  } else if (timers[r][t].selectedOption == TIMER_RESET_COUNT) {
+    if (relays[r].mode == MODE_CYC) {
+      timers[r][t].cycle_count = 0;
+      cycleCountBuffer[r][t] = 0;
+      cycle_count_changed = true;
+
+      timers[r][t].cycle_last_state_change_time_seconds = 0;
+      timers[r][t].cycle_is_on = false;
+      updateCycleResumeStateInEeprom(r, t);
+
+      showAlert((const __FlashStringHelper*)MSG_COUNT_RESET_OK);
+      needsDisplayUpdate = true;
+    }
+  } else if (timers[r][t].selectedOption >= TIMER_ON_TIME) {
+
+    if (timers[r][t].selectedOption == TIMER_ON_TIME || timers[r][t].selectedOption == TIMER_OFF_TIME) {
+      if (relays[r].mode != MODE_AUT && relays[r].mode != MODE_CYC) return;
+    } else {
+      if (relays[r].mode != MODE_CYC) return;
+    }
+
+
+    if (timers[r][t].setting_step == STEP_NAV_TIMER) {
+      timers[r][t].setting_step = STEP_HH_OR_VALUE;
+
+    } else if (timers[r][t].setting_step == STEP_HH_OR_VALUE) {
+      if (timers[r][t].selectedOption == TIMER_ON_TIME || timers[r][t].selectedOption == TIMER_OFF_TIME || (timers[r][t].selectedOption >= TIMER_CYCLE_ON_DUR && timers[r][t].selectedOption <= TIMER_CYCLE_OFF_DUR)) {
+        timers[r][t].setting_step = STEP_MM;
+      } else {
+        timers[r][t].setting_step = STEP_NAV_TIMER;
+      }
+
+    } else if (timers[r][t].setting_step == STEP_MM) {
+      timers[r][t].setting_step = STEP_NAV_TIMER;
+    }
+
+    if (timers[r][t].setting_step == STEP_NAV_TIMER) {
+      lcd.noCursor();
+      lcd.noBlink();
+      settings_changed = true;
+      lastSettingsChangeTime = millis();
+    }
+  }
+}
+
+
+void selectSavePrompt() {
+  if (nav.selectedIndex == 0) {
+    saveSettings();
+    settings_changed = false;
+  } else {
+    loadSettings();
+    settings_changed = false;
+  }
+  nav.currentState = MENU_HOME;
+  nav.selectedIndex = 0;
+  lcd.noCursor();
+  lcd.noBlink();
+}
